@@ -1,0 +1,52 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  background: #07090d;
+  font-family: 'IBM Plex Mono', 'Courier New', monospace;
+  color: #e0e0e8;
+  overflow: hidden;
+}
+
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: #0c0f14; }
+::-webkit-scrollbar-thumb { background: #1e2230; border-radius: 2px; }
+
+textarea { resize: none; font-family: inherit; }
+button { font-family: inherit; }
+
+/* Leaflet overrides */
+.leaflet-container { background: #0d1117; font-family: 'IBM Plex Mono', monospace; }
+.leaflet-popup-content-wrapper {
+  background: #0d1520;
+  border: 1px solid #1e2a40;
+  border-radius: 6px;
+  color: #c8d8e8;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+}
+.leaflet-popup-tip { background: #0d1520; }
+.leaflet-popup-content { margin: 10px 14px; line-height: 1.6; }
+.leaflet-control-zoom a {
+  background: #0d1520 !important;
+  color: #60a5fa !important;
+  border-color: #1e2a40 !important;
+}
+.leaflet-control-attribution {
+  background: #07090daa !important;
+  color: #333 !important;
+  font-size: 9px !important;
+}
+.leaflet-control-attribution a { color: #444 !important; }
+
+/* Animations */
+@keyframes spin  { to { transform: rotate(360deg); } }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+@keyframes fadeIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:translateY(0)} }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+.spin  { animation: spin  1s linear infinite; display: inline-block; }
+.blink { animation: blink 1s step-end infinite; }
+.pulse { animation: pulse 2s ease-in-out infinite; }
+.fade-in { animation: fadeIn 0.2s ease; }
