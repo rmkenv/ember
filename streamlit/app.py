@@ -403,7 +403,7 @@ with tab_chat:
         st.session_state.messages.append({"role":"user","content":prompt})
         with st.chat_message("user"): st.markdown(prompt)
         noaa_items = st.session_state.get('noaa_items', [])
-    ctx = build_context(st.session_state.files, st.session_state.api_results, active_kb, st.session_state.esri_items, noaa_items)
+        ctx = build_context(st.session_state.files, st.session_state.api_results, active_kb, st.session_state.esri_items, noaa_items)
         msgs = [{"role":m["role"],"content":m["content"]} for m in st.session_state.messages[-10:]]
         with st.chat_message("assistant"):
             ph = st.empty(); full=""
