@@ -283,8 +283,12 @@ def build_map(active_layers, show_radar=False, show_wind=False, wind_obs=None, l
 
     # ── NEXRAD radar tile overlay ──────────────────────────────────────────────
     if show_radar:
+        # Cache-bust every 5 minutes so browsers fetch fresh tiles from MESONET.
+        # MESONET updates composites every ~5min; floor to nearest 5min epoch.
+        import time as _time
+        epoch_5min = int(_time.time() // 300)
         folium.TileLayer(
-            tiles="https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/{z}/{x}/{y}.png",
+            tiles=f"https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/{{z}}/{{x}}/{{y}}.png?_={epoch_5min}",
             name="NEXRAD Radar",
             attr='NEXRAD &copy; Iowa State MESONET',
             opacity=0.65,
@@ -394,17 +398,20 @@ with st.sidebar:
     active_layers = [k for k,label in layer_opts.items() if st.checkbox(label,value=True,key=f"map_{k}")]
 
     st.markdown("**WEATHER OVERLAYS**")
-    show_radar = st.checkbox("📡 NEXRAD Radar", value=False, key="show_radar",
+    # Default both to True on first load — use setdefault so user toggles stick
+    if "show_radar" not in st.session_state: st.session_state["show_radar"] = True
+    if "show_wind"  not in st.session_state: st.session_state["show_wind"]  = True
+
+    show_radar = st.checkbox("📡 NEXRAD Radar", key="show_radar",
                              help="Iowa State MESONET composite reflectivity tiles — ~5min latency, no key required")
-    show_wind  = st.checkbox("💨 Wind Observations", value=False, key="show_wind",
-                             help="Live NWS surface obs from KNYC, KJFK, KEWR, KLGA")
-    if show_wind:
-        if st.button("↺ Refresh Wind", use_container_width=True):
-            with st.spinner("Fetching wind obs…"):
-                st.session_state.wind_obs = fetch_wind_obs()
-        if "wind_obs" not in st.session_state:
-            with st.spinner("Fetching wind obs…"):
-                st.session_state.wind_obs = fetch_wind_obs()
+    show_wind  = st.checkbox("💨 Wind Observations", key="show_wind",
+                             help="Live NWS surface obs from KNYC, KJFK, KEWR, KLGA — auto-refreshes every 5min")
+
+    # Auto-fetch wind obs on first load
+    if "wind_obs" not in st.session_state:
+        st.session_state.wind_obs            = fetch_wind_obs()
+        st.session_state.wind_obs_fetched_at = _dt.datetime.now()
+
     wind_obs = st.session_state.get("wind_obs", []) if show_wind else []
 
     st.divider()
@@ -427,11 +434,29 @@ with st.sidebar:
     st.divider()
     if st.button("Clear Chat",use_container_width=True): st.session_state.messages=[]; st.rerun()
 
+# ── Top-level auto-refresh ────────────────────────────────────────────────────
+# Ticks every 60s. On each tick we check whether wind obs or NOAA endpoints
+# are stale and refresh them. Radar tiles are cache-busted via the URL timestamp.
+from streamlit_autorefresh import st_autorefresh as _st_autorefresh
+_tick = _st_autorefresh(interval=60_000, key="global_autorefresh")
+
+# Refresh wind obs if older than 5 minutes (300s)
+_wind_age = (
+    (_dt.datetime.now() - st.session_state.get("wind_obs_fetched_at", _dt.datetime.min)).total_seconds()
+    if "wind_obs_fetched_at" in st.session_state else 999
+)
+if _wind_age > 300:
+    st.session_state.wind_obs            = fetch_wind_obs()
+    st.session_state.wind_obs_fetched_at = _dt.datetime.now()
+
 # ── Main layout ────────────────────────────────────────────────────────────────
 st.markdown("### 🗺️ NYC Operational Map")
 
 if show_wind and wind_obs:
-    st.markdown("**💨 Current Wind Observations**")
+    wind_fetched = st.session_state.get("wind_obs_fetched_at")
+    wind_age_s   = int((_dt.datetime.now() - wind_fetched).total_seconds()) if wind_fetched else None
+    wind_age_str = f"{wind_age_s//60}m{wind_age_s%60:02d}s ago" if wind_age_s is not None else "?"
+    st.markdown(f"**💨 Wind Observations** <span style='font-size:11px;color:#446'>· fetched {wind_age_str} · auto-refreshes every 5min</span>", unsafe_allow_html=True)
     wind_cols = st.columns(min(len(wind_obs), 4))
     for i, o in enumerate(wind_obs):
         with wind_cols[i % 4]:
@@ -445,16 +470,20 @@ if show_wind and wind_obs:
             )
 
 if show_radar:
-    st.caption("📡 NEXRAD radar overlay active — ~5min latency · Iowa State MESONET")
+    import time as _time2
+    next_refresh = 300 - (int(_time2.time()) % 300)
+    st.caption(f"📡 NEXRAD radar active — tiles refresh every 5min · next refresh in ~{next_refresh}s · Iowa State MESONET")
 
 # Flood alert banner
-live_rdgs = build_live_readings(st.session_state.api_results)
+live_rdgs = {**build_live_readings(st.session_state.api_results),
+             **_extract_map_readings_from_noaa()}
+
 if "__flood_alert__" in live_rdgs:
     a = live_rdgs["__flood_alert__"]
     st.error(f"⚠ **{a['event']}** ({a['severity']}) — {a['headline']}")
 
-map_data = st_folium(build_map(active_layers, show_radar=show_radar, show_wind=show_wind, wind_obs=wind_obs,
-                              live_readings=build_live_readings(st.session_state.api_results)),
+map_data = st_folium(build_map(active_layers, show_radar=show_radar, show_wind=show_wind,
+                               wind_obs=wind_obs, live_readings=live_rdgs),
                      width="100%", height=360, returned_objects=["last_object_clicked_popup"])
 
 if map_data and map_data.get("last_object_clicked_popup"):
@@ -500,6 +529,39 @@ NOAA_ENDPOINTS_FLAT = [
 
 import datetime as _dt
 
+# ── Endpoints that feed the map directly ──────────────────────────────────────
+# These are auto-fetched on load and auto-refreshed every N seconds.
+# Their data is piped into build_live_readings() for map marker enrichment.
+MAP_CONNECTED_ENDPOINTS = {
+    "coops_battery",     # Battery water level → gauge marker
+    "coops_kings_point", # Kings Point water level → gauge marker
+    "coops_sandy_hook",  # Sandy Hook water level → gauge marker
+    "coops_predictions", # Tidal predictions → gauge popup
+    "coops_wind",        # Wind at Battery → gauge popup
+    "nws_alerts_ny",     # NWS alerts → flood alert banner + marker color
+    "nws_alerts_severe", # Severe alerts → priority banner
+    "nws_obs_knyc",      # Central Park obs → wind arrow
+    "nws_obs_kjfk",      # JFK obs → wind arrow
+}
+
+# Refresh intervals per category (seconds). 0 = no auto-refresh.
+REFRESH_INTERVALS = {
+    "coops_battery":     300,   # 5 min — CO-OPS updates every 6 min
+    "coops_kings_point": 300,
+    "coops_sandy_hook":  300,
+    "coops_wind":        300,
+    "coops_predictions": 1800,  # 30 min — predictions change slowly
+    "nws_alerts_ny":     180,   # 3 min — alerts can change quickly
+    "nws_alerts_severe": 180,
+    "nws_obs_knyc":      300,
+    "nws_obs_kjfk":      300,
+    "nws_forecast_nyc":  3600,  # 1 hr — forecast rarely changes faster
+    "nws_forecast_hrly": 3600,
+    "nws_grid_wind":     3600,
+    "ncei_daily_cp":     86400, # 24 hr — daily summaries
+    "ncei_daily_jfk":    86400,
+}
+
 def _resolve_url(ep):
     url = ep["url"]
     if ep.get("dynamic"):
@@ -513,63 +575,229 @@ def _fetch_noaa_ep(ep):
     try:
         r = requests.get(url, timeout=10, headers={"User-Agent":"EMBER/1.0"})
         r.raise_for_status()
-        if ep.get("text") or "text/plain" in r.headers.get("content-type",""):
-            return {"success":True,"data":r.text,"text":True,"ep":ep}
-        return {"success":True,"data":r.json(),"text":False,"ep":ep}
+        is_text = ep.get("text") or "text/plain" in r.headers.get("content-type","")
+        data = r.text if is_text else r.json()
+        return {"success":True,"data":data,"text":is_text,"ep":ep,
+                "fetched_at": _dt.datetime.now().strftime("%H:%M:%S")}
     except Exception as e:
-        return {"success":False,"error":str(e),"ep":ep}
+        return {"success":False,"error":str(e),"ep":ep,
+                "fetched_at": _dt.datetime.now().strftime("%H:%M:%S")}
 
 def _summarize_noaa(result):
     if not result["success"]: return f"[{result['ep']['name']}: failed — {result['error']}]"
     d, ep = result["data"], result["ep"]
+    ts = result.get("fetched_at","?")
     try:
-        if result.get("text"): return f"[NOAA {ep['name']}]\n{str(d)[:800]}"
+        if result.get("text"): return f"[NOAA {ep['name']} @ {ts}]\n{str(d)[:800]}"
         if "features" in d and "alert" in ep["id"]:
             alerts = "\n".join(f"  - {f['properties']['event']} ({f['properties']['severity']}): {str(f['properties'].get('headline',''))[:90]}" for f in d["features"][:5])
-            return f"[NWS Alerts: {len(d['features'])} active]\n{alerts or '  None'}"
+            return f"[NWS Alerts @ {ts}: {len(d['features'])} active]\n{alerts or '  None active'}"
         if "forecast" in ep["id"] and "properties" in d and "periods" in d.get("properties",{}):
             periods = "\n".join(f"  {p['name']}: {p['shortForecast']}, {p['temperature']}°{p['temperatureUnit']}" for p in d["properties"]["periods"][:6])
-            return f"[NWS Forecast]\n{periods}"
+            return f"[NWS Forecast @ {ts}]\n{periods}"
         if "grid" in ep["id"] and "properties" in d:
             p = d["properties"]
-            ws = p.get("windSpeed",{}).get("values",[])[:6]
-            speeds = ", ".join(f"{(v['value']*0.621371):.0f}mph" for v in ws if v.get("value") is not None)
+            ws  = p.get("windSpeed",{}).get("values",[])[:6]
             qpf = p.get("quantitativePrecipitation",{}).get("values",[])[:6]
+            speeds = ", ".join(f"{(v['value']*0.621371):.0f}mph" for v in ws if v.get("value") is not None)
             inches = ", ".join(f"{(v['value']*0.0393701):.2f}\"" for v in qpf if v.get("value") is not None)
-            return f"[NWS Gridpoint Wind & Precip]\n  Wind (next 6h): {speeds}\n  QPF (next 6h): {inches}"
+            return f"[NWS Gridpoint Wind & Precip @ {ts}]\n  Wind (next 6h): {speeds}\n  QPF (next 6h): {inches}"
         if "obs" in ep["id"] and "properties" in d:
             p = d["properties"]
-            tempF = f"{(p['temperature']['value']*9/5+32):.1f}°F" if p.get("temperature",{}).get("value") is not None else "?"
-            windMph = f"{(p['windSpeed']['value']*0.621371):.1f}mph" if p.get("windSpeed",{}).get("value") is not None else "?"
-            return f"[NWS Obs — {ep['name']}]\n  Temp: {tempF} | Wind: {windMph} | {p.get('textDescription','?')}"
-        if "coops_battery" in ep["id"] and "data" in d:
+            tempF   = f"{(p['temperature']['value']*9/5+32):.1f}°F" if p.get("temperature",{}).get("value") is not None else "?"
+            windMph = f"{(p['windSpeed']['value']*0.621371):.1f}mph"  if p.get("windSpeed",{}).get("value")  is not None else "?"
+            return f"[NWS Obs — {ep['name']} @ {ts}]\n  Temp: {tempF} | Wind: {windMph} | {p.get('textDescription','?')}"
+        if "coops" in ep["id"] and "data" in d:
             latest = d["data"][-1] if d.get("data") else {}
-            return f"[CO-OPS Battery Water Level]\n  Latest: {latest.get('v','?')} ft MLLW @ {latest.get('t','?')}"
+            meta   = d.get("metadata",{})
+            return f"[CO-OPS {meta.get('name', ep['name'])} @ {ts}]\n  Water level: {latest.get('v','?')} ft MLLW @ {latest.get('t','?')}"
         if "predictions" in ep["id"] and "predictions" in d:
-            preds = "\n".join(f"  {'HIGH' if p['type']=='H' else 'low '} {p['v']}ft @ {p['t']}" for p in d["predictions"][:6])
-            return f"[CO-OPS Tidal Predictions]\n{preds}"
+            preds = "\n".join(f"  {'HIGH' if p['type']=='H' else 'low '} {p['v']}ft @ {p['t']}" for p in d["predictions"][:8])
+            return f"[CO-OPS Tidal Predictions @ {ts}]\n{preds}"
+        if "coops_wind" in ep["id"] and "data" in d:
+            latest = d["data"][-1] if d.get("data") else {}
+            return f"[CO-OPS Wind @ {ts}]\n  Speed: {latest.get('s','?')} knots | Dir: {latest.get('dr','?')} | Gusts: {latest.get('g','?')} knots"
         if "stations" in ep["id"] and "stations" in d:
-            return f"[CO-OPS Stations: {len(d['stations'])}]\n" + "\n".join(f"  {s['id']}: {s['name']}" for s in d["stations"][:8])
+            return f"[CO-OPS Stations: {len(d['stations'])} @ {ts}]\n" + "\n".join(f"  {s['id']}: {s['name']}" for s in d["stations"][:8])
         if "datasets" in ep["id"] and "datasets" in d:
             return f"[NCEI Datasets: {len(d['datasets'])}]\n" + "\n".join(f"  {ds['id']}: {ds['name']}" for ds in d["datasets"][:10])
         if isinstance(d, list) and len(d) > 0 and isinstance(d[0], dict) and "DATE" in d[0]:
             rows = "\n".join(f"  {r['DATE']}: TMAX={r.get('TMAX','?')} TMIN={r.get('TMIN','?')} PRCP={r.get('PRCP','?')}" for r in d[:7])
-            return f"[NCEI Daily Summaries]\n{rows}"
+            return f"[NCEI Daily Summaries @ {ts}]\n{rows}"
         if isinstance(d, list) and ep["id"] == "swpc_alerts":
-            return f"[Space Weather Alerts: {len(d)}]\n" + "\n".join(f"  {str(a.get('message',''))[:120]}" for a in d[:4])
-        return f"[NOAA {ep['name']}]: {json.dumps(d)[:400]}"
+            return f"[Space Weather Alerts @ {ts}: {len(d)}]\n" + "\n".join(f"  {str(a.get('message',''))[:120]}" for a in d[:4])
+        return f"[NOAA {ep['name']} @ {ts}]: {json.dumps(d)[:400]}"
     except Exception as e:
         return f"[NOAA {ep['name']}: parse error — {e}]"
 
+def _upsert_noaa_kb(ep, result):
+    """Add or replace a NOAA endpoint's data in noaa_items (KB). Always timestamps."""
+    content = _summarize_noaa(result)
+    ts      = result.get("fetched_at", _dt.datetime.now().strftime("%H:%M:%S"))
+    entry   = {
+        "name":      f"NOAA: {ep['name']}",
+        "item_id":   ep["id"],
+        "content":   f"[NOAA Open Data — {ep['name']}]\nFetched: {ts}\nSource: {_resolve_url(ep)}\n\n{content}",
+        "fetched_at": ts,
+        "map_connected": ep["id"] in MAP_CONNECTED_ENDPOINTS,
+    }
+    items = st.session_state.noaa_items
+    idx   = next((i for i, x in enumerate(items) if x["item_id"] == ep["id"]), None)
+    if idx is not None:
+        items[idx] = entry          # replace existing
+    else:
+        items.append(entry)         # new entry
+
+def _extract_map_readings_from_noaa():
+    """
+    Build live_readings dict for build_map() from whatever is in noaa_results.
+    Covers CO-OPS water levels and NWS alerts — same structure as build_live_readings().
+    """
+    readings = {}
+    for ep_id, result in st.session_state.get("noaa_results", {}).items():
+        if not result.get("success"): continue
+        d  = result["data"]
+        ep = result["ep"]
+        ts = result.get("fetched_at","?")
+
+        # CO-OPS water level endpoints
+        if isinstance(d, dict) and "data" in d and ep_id.startswith("coops_"):
+            meta   = d.get("metadata", {})
+            values = d.get("data", [])
+            if values:
+                latest = values[-1]
+                try:
+                    fval = float(latest.get("v", 0))
+                except ValueError:
+                    continue
+                station_name = meta.get("name") or ep["name"]
+                readings[station_name] = {
+                    "level":  f"{fval:.2f}",
+                    "unit":   "ft MLLW",
+                    "source": f"CO-OPS @ {ts}",
+                    "status": "flood"    if fval > 10
+                              else "elevated" if fval > 5
+                              else "normal",
+                }
+
+        # CO-OPS tidal predictions — add next HIGH tide to Battery marker
+        if isinstance(d, dict) and "predictions" in d and ep_id == "coops_predictions":
+            next_high = next((p for p in d["predictions"] if p.get("type") == "H"), None)
+            if next_high:
+                readings["__next_high_tide__"] = {
+                    "level": next_high["v"],
+                    "unit":  "ft MLLW",
+                    "time":  next_high["t"],
+                    "source": f"CO-OPS predictions @ {ts}",
+                }
+
+        # CO-OPS wind at Battery
+        if isinstance(d, dict) and "data" in d and ep_id == "coops_wind":
+            wvals = d.get("data", [])
+            if wvals:
+                w = wvals[-1]
+                readings["__battery_wind__"] = {
+                    "speed_knots": w.get("s","?"),
+                    "direction":   w.get("dr","?"),
+                    "gusts_knots": w.get("g","?"),
+                    "source": f"CO-OPS @ {ts}",
+                }
+
+        # NWS alerts
+        if isinstance(d, dict) and "features" in d and "alert" in ep_id:
+            for f in d["features"]:
+                evt = f.get("properties",{}).get("event","")
+                if any(kw in evt.lower() for kw in ["flood","surge","coastal"]):
+                    readings["__flood_alert__"] = {
+                        "event":    evt,
+                        "severity": f["properties"].get("severity",""),
+                        "headline": (f["properties"].get("headline") or "")[:120],
+                        "source":   f"NWS @ {ts}",
+                    }
+                    break  # first flood/surge alert is enough
+
+        # NWS observations (for wind obs on map)
+        if isinstance(d, dict) and "properties" in d and "obs" in ep_id:
+            p = d["properties"]
+            station_id = ep_id.replace("nws_obs_","").upper()
+            speed_ms  = p.get("windSpeed",{}).get("value")
+            gust_ms   = p.get("windGust",{}).get("value")
+            dir_deg   = p.get("windDirection",{}).get("value")
+            precip_mm = p.get("precipitationLastHour",{}).get("value")
+            if speed_ms is not None and dir_deg is not None:
+                readings[f"__nws_obs_{station_id}__"] = {
+                    "station":   station_id,
+                    "speed_mph": round(speed_ms * 2.237, 1),
+                    "gust_mph":  round(gust_ms * 2.237, 1) if gust_ms else None,
+                    "dir_deg":   dir_deg,
+                    "precip_in": round(precip_mm * 0.0393701, 2) if precip_mm else None,
+                    "desc":      p.get("textDescription",""),
+                    "source":    f"NWS @ {ts}",
+                }
+
+    return readings
+
+# ── Auto-fetch map-connected endpoints on first load ──────────────────────────
+def _auto_fetch_map_endpoints():
+    """Fetch all MAP_CONNECTED_ENDPOINTS that haven't been fetched yet this session."""
+    ep_map = {ep["id"]: ep for ep in NOAA_ENDPOINTS_FLAT}
+    for ep_id in MAP_CONNECTED_ENDPOINTS:
+        ep = ep_map.get(ep_id)
+        if not ep: continue
+        if ep_id not in st.session_state.noaa_results:
+            result = _fetch_noaa_ep(ep)
+            st.session_state.noaa_results[ep_id] = result
+            if result["success"]:
+                _upsert_noaa_kb(ep, result)
+
+def _refresh_stale_endpoints():
+    """Re-fetch any endpoint whose age exceeds its refresh interval."""
+    now    = _dt.datetime.now()
+    ep_map = {ep["id"]: ep for ep in NOAA_ENDPOINTS_FLAT}
+    for ep_id, interval in REFRESH_INTERVALS.items():
+        if interval == 0: continue
+        result = st.session_state.noaa_results.get(ep_id)
+        if result and result.get("fetched_at"):
+            try:
+                fetched = _dt.datetime.strptime(result["fetched_at"], "%H:%M:%S").replace(
+                    year=now.year, month=now.month, day=now.day)
+                age_secs = (now - fetched).total_seconds()
+                if age_secs < interval: continue
+            except: pass
+        ep = ep_map.get(ep_id)
+        if not ep: continue
+        new_result = _fetch_noaa_ep(ep)
+        st.session_state.noaa_results[ep_id] = new_result
+        if new_result["success"]:
+            _upsert_noaa_kb(ep, new_result)
+
 with tab_noaa:
     st.markdown("#### NOAA Open Data Stack")
-    st.caption("No API key required · NWS · CO-OPS Tides & Currents · NCEI Climate · SPC · SWPC Space Weather")
+    st.caption("Auto-fetches map-connected endpoints · Auto-refreshes stale feeds · All data auto-added to KB")
 
     if "noaa_results" not in st.session_state: st.session_state.noaa_results = {}
     if "noaa_items"   not in st.session_state: st.session_state.noaa_items   = []
 
+    # Auto-fetch map-connected endpoints on first load, refresh stale ones on every tick
+    _auto_fetch_map_endpoints()
+    _refresh_stale_endpoints()
+
+    # ── Status summary ──────────────────────────────────────────────────────
+    n_fetched   = len(st.session_state.noaa_results)
+    n_kb        = len(st.session_state.noaa_items)
+    n_live      = sum(1 for r in st.session_state.noaa_results.values() if r.get("success"))
+    n_map       = sum(1 for x in st.session_state.noaa_items if x.get("map_connected"))
+
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Endpoints fetched", n_fetched)
+    s2.metric("Live / OK",         n_live)
+    s3.metric("In KB",             n_kb)
+    s4.metric("Map-connected",     n_map)
+
+    st.divider()
+
     nc1, nc2 = st.columns([3,2])
-    with nc1: noaa_search = st.text_input("Search endpoints…", placeholder="flood, tide, temperature, alerts, solar wind…", key="noaa_search")
+    with nc1: noaa_search = st.text_input("Search endpoints…", placeholder="flood, tide, temperature, alerts…", key="noaa_search")
     with nc2: noaa_cat    = st.selectbox("Category", ["All","NWS","CO-OPS","NCEI","SPC","SWPC"], key="noaa_cat")
 
     filtered_eps = [ep for ep in NOAA_ENDPOINTS_FLAT if
@@ -580,64 +808,68 @@ with tab_noaa:
          any(noaa_search.lower() in t for t in ep.get("tags",[])))
     ]
 
-    injected_noaa_ids = {i["item_id"] for i in st.session_state.noaa_items}
-    st.caption(f"{len(filtered_eps)} endpoint{'s' if len(filtered_eps)!=1 else ''} · {len(st.session_state.noaa_results)} fetched · {len(injected_noaa_ids)} in KB")
-
     for ep in filtered_eps:
-        result  = st.session_state.noaa_results.get(ep["id"])
-        injected = ep["id"] in injected_noaa_ids
+        result    = st.session_state.noaa_results.get(ep["id"])
+        in_kb     = any(x["item_id"] == ep["id"] for x in st.session_state.noaa_items)
+        is_map    = ep["id"] in MAP_CONNECTED_ENDPOINTS
+        interval  = REFRESH_INTERVALS.get(ep["id"], 0)
+        ts        = result.get("fetched_at","—") if result else "—"
 
-        st.markdown(f"""<div class="esri-card" style="border-left:3px solid {ep['color']}">
-            <div style="font-weight:700;color:#dde;margin-bottom:2px">{ep['icon']} {ep['name']}</div>
-            <div style="font-size:10px;color:#556;margin-bottom:4px">{ep['desc']}</div>
-            <div>{"".join(f'<span class="pill" style="background:{ep["color"]}18;color:{ep["color"]};border:1px solid {ep["color"]}33;margin:1px">{t}</span>' for t in ep.get("tags",[])[:4])}</div>
+        border_color = ep["color"] if is_map else "#1a1e2e"
+        map_badge    = f'<span class="pill" style="background:#34d39918;color:#34d399;border:1px solid #34d39933">🗺 MAP</span>' if is_map else ""
+        kb_badge     = f'<span class="pill p-green">✓ KB</span>' if in_kb else ""
+        refresh_txt  = f"↺ {interval//60}min" if interval else ""
+
+        st.markdown(f"""<div class="esri-card" style="border-left:3px solid {border_color}">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start">
+              <div>
+                <div style="font-weight:700;color:#dde;margin-bottom:2px">{ep['icon']} {ep['name']}</div>
+                <div style="font-size:10px;color:#556;margin-bottom:4px">{ep['desc']}</div>
+                <div>{map_badge}{kb_badge}
+                  {"".join(f'<span class="pill" style="background:{ep["color"]}18;color:{ep["color"]};border:1px solid {ep["color"]}33;margin:1px">{t}</span>' for t in ep.get("tags",[])[:3])}
+                </div>
+              </div>
+              <div style="text-align:right;font-size:9px;color:#334;white-space:nowrap">
+                {f"<span style='color:#4ade80'>● OK</span>" if result and result.get("success") else f"<span style='color:#f87171'>○ —</span>" if result else "<span style='color:#334'>○ not fetched</span>"}
+                {f"<br>@ {ts}" if ts != "—" else ""}
+                {f"<br>{refresh_txt}" if refresh_txt else ""}
+              </div>
+            </div>
         </div>""", unsafe_allow_html=True)
 
-        btn1, btn2, btn3, status_col = st.columns([1,1,1,2])
+        btn1, btn2, btn3 = st.columns([1,1,2])
 
         with btn1:
-            if st.button("▶ Fetch", key=f"nfetch_{ep['id']}", use_container_width=True):
-                with st.spinner(f"Fetching…"):
-                    st.session_state.noaa_results[ep["id"]] = _fetch_noaa_ep(ep)
+            if st.button("▶ Fetch now", key=f"nfetch_{ep['id']}", use_container_width=True):
+                with st.spinner("Fetching…"):
+                    new_result = _fetch_noaa_ep(ep)
+                st.session_state.noaa_results[ep["id"]] = new_result
+                if new_result["success"]:
+                    _upsert_noaa_kb(ep, new_result)   # auto-add/replace in KB
                 st.rerun()
 
         with btn2:
-            if result and result["success"]:
-                if not injected:
-                    if st.button("+ Add to KB", key=f"ninject_{ep['id']}", use_container_width=True):
-                        content = _summarize_noaa(result)
-                        st.session_state.noaa_items.append({
-                            "name": f"NOAA: {ep['name']}",
-                            "item_id": ep["id"],
-                            "content": f"[NOAA Open Data — {ep['name']}]\nSource: {_resolve_url(ep)}\n\n{content}"
-                        })
-                        st.session_state.pending_query = f"I just added '{ep['name']}' NOAA data to the knowledge base. Summarize the data and flag any emergency-relevant readings for NYC."
-                        st.rerun()
-                else:
-                    st.button("✓ In KB", key=f"ninjected_{ep['id']}", disabled=True, use_container_width=True)
-
-        with btn3:
             st.link_button("↗ URL", _resolve_url(ep))
 
-        with status_col:
-            if result:
-                if result["success"]:
-                    st.markdown('<span class="pill p-green">● OK</span>', unsafe_allow_html=True)
-                else:
-                    st.markdown(f'<span class="pill p-red">● ERR: {result["error"][:50]}</span>', unsafe_allow_html=True)
-
-        if result and result["success"]:
-            with st.expander("Preview"):
-                st.code(_summarize_noaa(result), language=None)
+        with btn3:
+            if result and result.get("success"):
+                with st.expander("Preview"):
+                    st.code(_summarize_noaa(result), language=None)
 
         st.markdown("---")
 
+    # ── KB contents ──────────────────────────────────────────────────────────
     if st.session_state.noaa_items:
-        st.markdown(f"**{len(st.session_state.noaa_items)} NOAA feed(s) in KB:**")
+        st.markdown(f"**{n_kb} NOAA feed(s) in KB** — auto-updated on refresh")
         for i, ni in enumerate(st.session_state.noaa_items):
-            c1, c2 = st.columns([5,1])
-            with c1: st.markdown(f'<span class="pill p-green">▶ {ni["name"][:60]}</span>', unsafe_allow_html=True)
+            c1, c2, c3 = st.columns([4, 1, 1])
+            with c1:
+                map_tag = " 🗺" if ni.get("map_connected") else ""
+                st.markdown(f'<span class="pill p-green">▶ {ni["name"][:50]}{map_tag} · {ni.get("fetched_at","?")}</span>',
+                            unsafe_allow_html=True)
             with c2:
+                st.caption(ni.get("fetched_at",""))
+            with c3:
                 if st.button("✕", key=f"rm_noaa_{i}"):
                     st.session_state.noaa_items.pop(i)
                     st.rerun()

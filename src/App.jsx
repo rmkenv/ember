@@ -64,8 +64,8 @@ export default function App() {
   const [streaming, setStreaming]           = useState(false)
   const [activeKB, setActiveKB]             = useState(["floodZones","evacZones","criticalInfrastructure","hazardProfiles","resources"])
   const [activeMapLayers, setActiveMapLayers] = useState(["floodRisk","hospitals","shelters","gauges","eoc"])
-  const [showRadar, setShowRadar]           = useState(false)
-  const [showWind,  setShowWind]            = useState(false)
+  const [showRadar, setShowRadar]           = useState(true)
+  const [showWind,  setShowWind]            = useState(true)
   const [files, setFiles]                   = useState([])          // uploaded docs
   const [esriItems, setEsriItems]           = useState([])          // ESRI metadata injections
   const [noaaItems, setNoaaItems]           = useState([])          // NOAA data injections

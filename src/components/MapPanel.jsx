@@ -5,8 +5,10 @@ const TILE_URL  = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png
 const TILE_ATTR = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>'
 
 // Iowa State MESONET NEXRAD composite reflectivity tiles — free, no key, ~5 min latency
-// n0q = base reflectivity, good for precip coverage
-const RADAR_TILE_URL  = "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/{z}/{x}/{y}.png"
+// Cache-bust with 5-minute epoch so the browser re-fetches fresh tiles automatically
+const radarEpoch  = () => Math.floor(Date.now() / 300_000) // changes every 5 min
+const RADAR_TILE_URL  = () =>
+  `https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/{z}/{x}/{y}.png?_=${radarEpoch()}`
 const RADAR_TILE_ATTR = 'NEXRAD Radar &copy; <a href="https://mesonet.agron.iastate.edu/">Iowa State MESONET</a>'
 
 // Wind barb direction lookup — returns CSS rotation for "from" bearing
@@ -139,14 +141,11 @@ export default function MapPanel({ activeLayers, onMarkerClick, showRadar, showW
         attribution: TILE_ATTR, maxZoom: 19, subdomains: "abcd"
       }).addTo(map)
 
-      // ── Radar tile layer (hidden by default) ──────────────────────────────
-      const radarLayer = L.tileLayer(RADAR_TILE_URL, {
+      // ── Radar tile layer (on by default) ─────────────────────────────────
+      const radarLayer = L.tileLayer(RADAR_TILE_URL(), {
         attribution: RADAR_TILE_ATTR,
         opacity: 0.65,
         maxZoom: 19,
-        tms: false,
-        // Cache-bust every 5 minutes to force tile refresh
-        // The MESONET tiles update every ~5 minutes
       })
       radarRef.current = radarLayer
       setRadarTime(new Date().toLocaleTimeString())
@@ -215,6 +214,47 @@ export default function MapPanel({ activeLayers, onMarkerClick, showRadar, showW
     }
   }, [activeLayers, ready])
 
+  // ── Auto-refresh radar tiles every 5 minutes ──────────────────────────────
+  useEffect(() => {
+    if (!ready) return
+    const id = setInterval(() => {
+      if (!leafletRef.current || !radarRef.current) return
+      const map = leafletRef.current
+      if (!map.hasLayer(radarRef.current)) return
+      // Replace tile layer with fresh cache-busted URL
+      import("leaflet").then(({ default: L }) => {
+        map.removeLayer(radarRef.current)
+        const newLayer = L.tileLayer(RADAR_TILE_URL(), {
+          attribution: RADAR_TILE_ATTR,
+          opacity: 0.65,
+          maxZoom: 19,
+        })
+        newLayer.addTo(map)
+        // Bring all marker layers above radar
+        for (const group of Object.values(layerRefs.current)) {
+          if (map.hasLayer(group)) { map.removeLayer(group); group.addTo(map) }
+        }
+        if (windRef.current && map.hasLayer(windRef.current)) {
+          map.removeLayer(windRef.current); windRef.current.addTo(map)
+        }
+        radarRef.current = newLayer
+        setRadarTime(new Date().toLocaleTimeString())
+      })
+    }, 300_000) // 5 minutes
+    return () => clearInterval(id)
+  }, [ready])
+
+  // ── Auto-refresh wind obs every 5 minutes when layer is visible ────────────
+  useEffect(() => {
+    if (!ready || !showWind) return
+    // Fetch immediately when enabled
+    fetchWindObs()
+    const id = setInterval(() => {
+      fetchWindObs()
+    }, 300_000) // 5 minutes
+    return () => clearInterval(id)
+  }, [ready, showWind, fetchWindObs])
+
   // ── Radar layer toggle ─────────────────────────────────────────────────────
   useEffect(() => {
     if (!ready || !leafletRef.current || !radarRef.current) return
@@ -272,12 +312,13 @@ export default function MapPanel({ activeLayers, onMarkerClick, showRadar, showW
     })
   }, [ready])
 
+  // ── Wind layer toggle + fetch ──────────────────────────────────────────────
   useEffect(() => {
     if (!ready || !leafletRef.current || !windRef.current) return
     const map = leafletRef.current
     if (showWind) {
       if (!map.hasLayer(windRef.current)) windRef.current.addTo(map)
-      fetchWindObs()
+      // fetchWindObs is called by the auto-refresh interval effect above
     } else {
       if (map.hasLayer(windRef.current)) map.removeLayer(windRef.current)
     }
@@ -295,7 +336,7 @@ export default function MapPanel({ activeLayers, onMarkerClick, showRadar, showW
           borderRadius: 4, padding: "3px 8px",
           fontSize: 9, fontFamily: "monospace", color: "#60a5fa"
         }}>
-          📡 NEXRAD · fetched {radarTime} · ~5min latency
+          📡 NEXRAD · {radarTime} · auto-refreshes every 5min
         </div>
       )}
 
