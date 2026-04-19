@@ -90,7 +90,30 @@ async function fetchStationObs(stationId) {
   } catch { return null }
 }
 
-export default function MapPanel({ activeLayers, onMarkerClick, showRadar, showWind }) {
+// ── Build popup HTML — shared for static and live-enriched markers ─────────────
+function buildPopupHTML(color, icon, f, reading) {
+  const statusColor = reading?.status === "flood"    ? "#f87171"
+                    : reading?.status === "elevated" ? "#facc15"
+                    : reading            ? "#4ade80"
+                    : null
+
+  return `<div style="font-family:'IBM Plex Mono',monospace">
+    <div style="font-weight:700;color:${color};margin-bottom:4px;font-size:12px">${icon} ${f.name}</div>
+    ${f.borough ? `<div style="color:#888;font-size:10px;margin-bottom:4px">${f.borough}</div>` : ""}
+    <div style="font-size:11px;color:#aac;margin-bottom:${reading ? 6 : 0}px">${f.note}</div>
+    ${reading ? `
+    <div style="border-top:1px solid #1e2a40;padding-top:6px;margin-top:2px">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">
+        <div style="width:8px;height:8px;border-radius:50%;background:${statusColor};flex-shrink:0"></div>
+        <span style="color:${statusColor};font-weight:700;font-size:11px">${reading.level} ${reading.unit}</span>
+        <span style="color:#556;font-size:9px">${reading.status?.toUpperCase()}</span>
+      </div>
+      <div style="color:#446;font-size:9px">${reading.source} · live reading</div>
+    </div>` : ""}
+  </div>`
+}
+
+export default function MapPanel({ activeLayers, onMarkerClick, showRadar, showWind, liveReadings = {} }) {
   const mapRef     = useRef(null)
   const leafletRef = useRef(null)
   const layerRefs  = useRef({})
@@ -137,13 +160,11 @@ export default function MapPanel({ activeLayers, onMarkerClick, showRadar, showW
         const group = L.layerGroup()
         layer.features.forEach(f => {
           const marker = L.marker([f.lat, f.lng], { icon: makeIcon(L, layer.color, layer.icon) })
-          marker.bindPopup(`
-            <div>
-              <div style="font-weight:700;color:${layer.color};margin-bottom:4px;font-size:12px">${layer.icon} ${f.name}</div>
-              ${f.borough ? `<div style="color:#888;font-size:10px;margin-bottom:4px">${f.borough}</div>` : ""}
-              <div style="font-size:11px;color:#aac">${f.note}</div>
-            </div>
-          `)
+          marker._emberKey     = key
+          marker._emberFeature = f
+          marker._emberColor   = layer.color
+          marker._emberIcon    = layer.icon
+          marker.bindPopup(buildPopupHTML(layer.color, layer.icon, f, null))
           marker.on("click", () => onMarkerClick?.({ ...f, layerLabel: layer.label, color: layer.color }))
           group.addLayer(marker)
         })
@@ -158,6 +179,31 @@ export default function MapPanel({ activeLayers, onMarkerClick, showRadar, showW
       if (leafletRef.current) { leafletRef.current.remove(); leafletRef.current = null }
     }
   }, [])
+
+  // ── Enrich gauge popups when live readings arrive ──────────────────────────
+  useEffect(() => {
+    if (!ready || !Object.keys(liveReadings).length) return
+    import("leaflet").then(({ default: L }) => {
+      const gaugeGroup = layerRefs.current["gauges"]
+      if (!gaugeGroup) return
+      gaugeGroup.eachLayer(marker => {
+        const f = marker._emberFeature
+        if (!f) return
+        // Match USGS site name to gauge feature name (partial, case-insensitive)
+        const reading = Object.entries(liveReadings).find(([siteName]) =>
+          siteName.toLowerCase().includes(f.name.split(",")[0].toLowerCase().split(" ")[0]) ||
+          f.name.toLowerCase().includes(siteName.toLowerCase().split(" at ")[0])
+        )?.[1]
+        marker.setPopupContent(buildPopupHTML(marker._emberColor, marker._emberIcon, f, reading ?? null))
+        // Re-color icon by flood status
+        if (reading?.status) {
+          const c = { flood: "#f87171", elevated: "#facc15", normal: "#4ade80" }[reading.status] ?? "#4ade80"
+          marker.setIcon(makeIcon(L, c, marker._emberIcon))
+          marker._emberColor = c
+        }
+      })
+    })
+  }, [liveReadings, ready])
 
   // ── Toggle marker layers ───────────────────────────────────────────────────
   useEffect(() => {

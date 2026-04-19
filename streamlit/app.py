@@ -94,6 +94,39 @@ def fetch_live(ep):
     except Exception as e:
         return {"success":False,"error":str(e),"name":ep["name"],"type":ep["type"]}
 
+def build_live_readings(api_results):
+    """Extract gauge readings from fetched API results for map marker enrichment."""
+    readings = {}
+    for r in api_results:
+        if not r.get("success"): continue
+        d = r.get("data", {})
+        # USGS stream gauge
+        if r.get("type") == "flood" and isinstance(d, dict) and "value" in d:
+            for ts in d["value"].get("timeSeries", []):
+                site = ts.get("sourceInfo", {}).get("siteName", "")
+                vals = ts.get("values", [{}])[0].get("value", [])
+                if vals and site:
+                    val = vals[-1].get("value")
+                    if val is not None:
+                        fval = float(val)
+                        readings[site] = {
+                            "level": f"{fval:.2f}",
+                            "unit": "ft",
+                            "source": "USGS",
+                            "status": "flood" if fval > 10 else "elevated" if fval > 5 else "normal"
+                        }
+        # NWS alerts — surface flood/surge events
+        if r.get("type") == "weather" and isinstance(d, dict) and "features" in d:
+            for f in d["features"]:
+                evt = f.get("properties", {}).get("event", "")
+                if "flood" in evt.lower() or "surge" in evt.lower():
+                    readings["__flood_alert__"] = {
+                        "event": evt,
+                        "severity": f["properties"].get("severity", ""),
+                        "headline": (f["properties"].get("headline") or "")[:100]
+                    }
+    return readings
+
 def summarize_api(result):
     if not result["success"]: return f"[{result['name']}: unavailable — {result['error']}]"
     d, t = result["data"], result["type"]
@@ -244,7 +277,8 @@ def fetch_wind_obs():
         except: continue
     return results
 
-def build_map(active_layers, show_radar=False, show_wind=False, wind_obs=None):
+def build_map(active_layers, show_radar=False, show_wind=False, wind_obs=None, live_readings=None):
+    live_readings = live_readings or {}
     m = folium.Map(location=[40.7128,-74.006], zoom_start=10, tiles="CartoDB dark_matter", prefer_canvas=True)
 
     # ── NEXRAD radar tile overlay ──────────────────────────────────────────────
@@ -263,10 +297,40 @@ def build_map(active_layers, show_radar=False, show_wind=False, wind_obs=None):
         if key not in active_layers: continue
         fg = folium.FeatureGroup(name=layer["label"])
         for f in layer["features"]:
-            folium.CircleMarker(location=[f["lat"],f["lng"]], radius=8, color=layer["color"], fill=True,
-                fill_color=layer["color"], fill_opacity=0.5,
-                popup=folium.Popup(f'<div style="font-family:monospace;font-size:11px"><b style="color:{layer["color"]}">{f["name"]}</b><br>{f["note"]}</div>', max_width=220),
-                tooltip=f["name"]).add_to(fg)
+            # For gauges, try to match a live reading
+            reading = None
+            marker_color = layer["color"]
+            if key == "gauges" and live_readings:
+                for site_name, r in live_readings.items():
+                    fname_first = f["name"].split(",")[0].lower().split()[0]
+                    if fname_first in site_name.lower() or site_name.lower().split(" at ")[0] in f["name"].lower():
+                        reading = r
+                        marker_color = {"flood":"#f87171","elevated":"#facc15","normal":"#4ade80"}.get(r.get("status","normal"), layer["color"])
+                        break
+
+            # Build popup HTML
+            live_html = ""
+            if reading:
+                status_color = {"flood":"#f87171","elevated":"#facc15","normal":"#4ade80"}.get(reading.get("status","normal"),"#4ade80")
+                live_html = f"""
+                <div style="border-top:1px solid #1e2a40;padding-top:6px;margin-top:4px">
+                  <span style="color:{status_color};font-weight:700">{reading.get('level','?')} {reading.get('unit','')}</span>
+                  <span style="color:#556;font-size:9px;margin-left:4px">{reading.get('status','').upper()}</span><br>
+                  <span style="color:#446;font-size:9px">{reading.get('source','NOAA')} · live</span>
+                </div>"""
+
+            popup_html = f"""<div style="font-family:monospace;font-size:11px">
+                <b style="color:{marker_color}">{f['name']}</b><br>
+                <span style="color:#778">{f['note']}</span>
+                {live_html}
+            </div>"""
+
+            folium.CircleMarker(
+                location=[f["lat"],f["lng"]], radius=8,
+                color=marker_color, fill=True, fill_color=marker_color, fill_opacity=0.6,
+                popup=folium.Popup(popup_html, max_width=240),
+                tooltip=f"{f['name']}" + (f" — {reading.get('level','?')} {reading.get('unit','')}" if reading else "")
+            ).add_to(fg)
         fg.add_to(m)
 
     # ── Wind observation arrows ────────────────────────────────────────────────
@@ -383,7 +447,14 @@ if show_wind and wind_obs:
 if show_radar:
     st.caption("📡 NEXRAD radar overlay active — ~5min latency · Iowa State MESONET")
 
-map_data = st_folium(build_map(active_layers, show_radar=show_radar, show_wind=show_wind, wind_obs=wind_obs),
+# Flood alert banner
+live_rdgs = build_live_readings(st.session_state.api_results)
+if "__flood_alert__" in live_rdgs:
+    a = live_rdgs["__flood_alert__"]
+    st.error(f"⚠ **{a['event']}** ({a['severity']}) — {a['headline']}")
+
+map_data = st_folium(build_map(active_layers, show_radar=show_radar, show_wind=show_wind, wind_obs=wind_obs,
+                              live_readings=build_live_readings(st.session_state.api_results)),
                      width="100%", height=360, returned_objects=["last_object_clicked_popup"])
 
 if map_data and map_data.get("last_object_clicked_popup"):

@@ -108,6 +108,33 @@ export default function App() {
     setFetchingAPIs(false)
   }
 
+  // Derive live gauge readings keyed by station name for MapPanel popup enrichment
+  // Structure: { "Battery Park Tidal Gauge": { level: "4.21", unit: "ft MLLW", status: "normal" }, … }
+  const liveReadings = (() => {
+    const readings = {}
+    for (const r of apiResults) {
+      if (!r.success) continue
+      // USGS stream gauge data
+      if (r.type === "flood" && r.data?.value?.timeSeries) {
+        for (const ts of r.data.value.timeSeries) {
+          const siteName = ts.sourceInfo?.siteName ?? ""
+          const val = ts.values?.[0]?.value?.[0]?.value
+          if (val != null) readings[siteName] = { level: val, unit: "ft", source: "USGS", status: parseFloat(val) > 10 ? "flood" : parseFloat(val) > 5 ? "elevated" : "normal" }
+        }
+      }
+      // NWS active alerts — flag relevant zones
+      if (r.type === "weather" && r.data?.features) {
+        for (const f of r.data.features) {
+          const event = f.properties?.event ?? ""
+          if (event.toLowerCase().includes("flood") || event.toLowerCase().includes("surge")) {
+            readings["__alert__"] = { event, severity: f.properties?.severity, headline: f.properties?.headline?.substring(0, 120) }
+          }
+        }
+      }
+    }
+    return readings
+  })()
+
   const ingestFile = useCallback(file => {
     const reader = new FileReader()
     reader.onload = e => setFiles(p => [...p, { name: file.name, content: e.target.result }])
@@ -324,7 +351,7 @@ export default function App() {
       >
         {/* Map */}
         <div style={{ width:`${mapWidth}%`, flexShrink:0, position:"relative", borderRight:"1px solid #0f1520" }}>
-          <MapPanel activeLayers={activeMapLayers} onMarkerClick={handleMarkerClick} showRadar={showRadar} showWind={showWind} />
+          <MapPanel activeLayers={activeMapLayers} onMarkerClick={handleMarkerClick} showRadar={showRadar} showWind={showWind} liveReadings={liveReadings} />
 
           {/* Legend */}
           <div style={{ position:"absolute", bottom:24, left:10, zIndex:1000, background:"#07090dee", border:"1px solid #1a1e28", borderRadius:6, padding:"8px 10px", fontSize:9.5, fontFamily:"monospace" }}>
