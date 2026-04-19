@@ -14,6 +14,11 @@ from io import StringIO
 import folium, requests, streamlit as st
 from streamlit_folium import st_folium
 from streamlit_autorefresh import st_autorefresh
+from tidal_gauges import (
+    fetch_all_ny_gauges, fetch_station_list,
+    build_gauge_popup, gauge_marker_color,
+    FLOOD_THRESHOLDS,
+)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 OLLAMA_API_KEY = st.secrets.get("OLLAMA_API_KEY", os.environ.get("OLLAMA_API_KEY", ""))
@@ -446,9 +451,12 @@ def fetch_wind_obs():
             continue
     return results
 
-def build_map(active_layers, show_radar=True, show_wind=True, wind_obs=None, live_readings=None):
+def build_map(active_layers, show_radar=True, show_wind=True, wind_obs=None,
+              live_readings=None, gauge_data=None, map_layers=None):
     live_readings = live_readings or {}
     wind_obs      = wind_obs or []
+    gauge_data    = gauge_data or {}
+    map_layers    = map_layers or []
     m = folium.Map(location=[40.7128, -74.006], zoom_start=10,
                    tiles="CartoDB dark_matter", prefer_canvas=True)
     # NEXRAD radar tiles with 5-min cache buster
@@ -459,6 +467,48 @@ def build_map(active_layers, show_radar=True, show_wind=True, wind_obs=None, liv
             name="NEXRAD Radar", attr="NEXRAD &copy; Iowa State MESONET",
             opacity=0.65, overlay=True, control=True,
         ).add_to(m)
+
+    # ── Live tidal gauge layer (separate from static gauge markers) ────────────
+    if gauge_data:
+        tg_fg = folium.FeatureGroup(name="🌊 Live Tidal Gauges (CO-OPS)", show=True)
+        for sid, gd in gauge_data.items():
+            ld = gd.get("level")
+            if not ld or not ld.get("lat") or not ld.get("lng"):
+                # Try to find coords from the station list if level data has no coords
+                continue
+            lat, lng = ld.get("lat", 0), ld.get("lng", 0)
+            if lat == 0 and lng == 0:
+                continue
+            color   = gauge_marker_color(gd)
+            lft     = ld.get("level_ft", 0)
+            status  = ld.get("status", "NORMAL")
+            popup_h = build_gauge_popup(gd)
+
+            # Pulsing circle — outer ring shows flood status, inner solid
+            folium.CircleMarker(
+                location=[lat, lng], radius=16,
+                color=color, fill=False, weight=2, opacity=0.5,
+            ).add_to(tg_fg)
+            folium.CircleMarker(
+                location=[lat, lng], radius=9,
+                color=color, fill=True, fill_color=color, fill_opacity=0.85, weight=2,
+                popup=folium.Popup(popup_h, max_width=280),
+                tooltip=f"🌊 {ld.get('station_name','Station')} — {lft:.2f}ft MLLW — {status}",
+            ).add_to(tg_fg)
+
+            # Level label
+            folium.Marker(
+                location=[lat, lng],
+                icon=folium.DivIcon(
+                    html=f'<div style="font-family:monospace;font-size:10px;font-weight:700;'
+                         f'color:{color};background:#07090dcc;padding:1px 4px;border-radius:3px;'
+                         f'border:1px solid {color}55;white-space:nowrap;margin-top:14px;margin-left:12px">'
+                         f'{lft:.2f}ft</div>',
+                    icon_size=(60, 20), icon_anchor=(0, 0)
+                )
+            ).add_to(tg_fg)
+
+        tg_fg.add_to(m)
     # Marker layers
     for key, layer in MAP_POINTS.items():
         if key not in active_layers: continue
@@ -517,14 +567,75 @@ def build_map(active_layers, show_radar=True, show_wind=True, wind_obs=None, liv
                 tooltip=f'{o["id"]}: {spd}mph'
             ).add_to(wfg)
         wfg.add_to(m)
+    # ── User-added map layers (NYC Open Data + ESRI Feature Layers) ───────────
+    LAYER_COLORS = ["#f472b6","#818cf8","#2dd4bf","#fb7185","#a3e635","#fbbf24","#60a5fa","#c084fc"]
+    for li, layer in enumerate(map_layers):
+        if not layer.get("visible", True): continue
+        lcolor = layer.get("color", LAYER_COLORS[li % len(LAYER_COLORS)])
+        fg = folium.FeatureGroup(name=f"{layer.get('icon','📍')} {layer['name']}", show=True)
+
+        for feat in layer.get("features", []):
+            ftype = feat.get("type", "point")
+
+            if ftype == "point":
+                popup_h = layer.get("popup_fn")(feat) if layer.get("popup_fn") else (
+                    f'<div style="font-family:monospace;font-size:11px">'
+                    f'<b style="color:{lcolor}">{feat.get("label","") or layer["name"]}</b></div>'
+                )
+                folium.CircleMarker(
+                    location=[feat["lat"], feat["lng"]], radius=6,
+                    color=lcolor, fill=True, fill_color=lcolor, fill_opacity=0.7, weight=1.5,
+                    popup=folium.Popup(popup_h, max_width=260),
+                    tooltip=feat.get("label", layer["name"])[:60],
+                ).add_to(fg)
+
+            elif ftype == "polygon":
+                try:
+                    folium.GeoJson(
+                        {"type": "Feature", "geometry": feat["geometry"], "properties": feat["props"]},
+                        style_function=lambda f, c=lcolor: {
+                            "fillColor": c, "color": c, "weight": 2,
+                            "fillOpacity": 0.25, "opacity": 0.8
+                        },
+                        tooltip=str(list(feat["props"].values())[0])[:60] if feat["props"] else layer["name"],
+                    ).add_to(fg)
+                except:
+                    pass
+
+            elif ftype == "line":
+                try:
+                    folium.GeoJson(
+                        {"type": "Feature", "geometry": feat["geometry"], "properties": feat["props"]},
+                        style_function=lambda f, c=lcolor: {"color": c, "weight": 3, "opacity": 0.8},
+                        tooltip=str(list(feat["props"].values())[0])[:60] if feat["props"] else layer["name"],
+                    ).add_to(fg)
+                except:
+                    pass
+
+        fg.add_to(m)
+
     folium.LayerControl().add_to(m)
     return m
 
-def build_context(files, api_results, active_modules, esri_items, noaa_items=None):
+def build_context(files, api_results, active_modules, esri_items, noaa_items=None, gauge_data=None):
     ctx = "=== NYC EMERGENCY MANAGEMENT KNOWLEDGE BASE ===\n\n"
     for key, mod in NYC_KB.items():
         if key in active_modules:
             ctx += f"--- {mod['label']} [{mod['source']}] ---\n{mod['data']}\n\n"
+    if gauge_data:
+        ctx += "--- LIVE TIDAL GAUGE READINGS (CO-OPS, 6-min updates) ---\n"
+        for sid, gd in gauge_data.items():
+            ld = gd.get("level")
+            if not ld: continue
+            nh = gd.get("next_high")
+            nl = gd.get("next_low")
+            ctx += (f"Station {sid} — {ld.get('station_name','?')}: "
+                    f"{ld.get('level_ft','?')} ft MLLW | {ld.get('status','?')} | "
+                    f"Trend: {ld.get('trend_str','?')} | "
+                    f"Next HIGH: {nh['level_ft']:.2f}ft @ {nh['time'] if nh else 'N/A'} | "
+                    f"Next LOW: {nl['level_ft']:.2f}ft @ {nl['time'] if nl else 'N/A'} | "
+                    f"Fetched: {gd.get('fetched_at','?')}\n")
+        ctx += "\n"
     if api_results:
         ctx += "--- LIVE API DATA ---\n"
         for r in api_results: ctx += summarize_api(r) + "\n"
@@ -617,6 +728,279 @@ def format_item_for_context(item, data=None):
     return block
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# NYC OPEN DATA (SOCRATA) HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Curated emergency-relevant NYC Open Data datasets with known geometry columns
+NYC_OPEN_DATA_PRESETS = [
+    {
+        "id":       "fhrw-4uyv",
+        "name":     "311 Service Requests (live)",
+        "agency":   "311",
+        "lat_col":  "latitude",
+        "lng_col":  "longitude",
+        "label_col":"complaint_type",
+        "desc":     "Real-time 311 complaints — filterable by type, borough, date",
+        "color":    "#60a5fa",
+        "icon":     "📞",
+        "filter":   None,
+    },
+    {
+        "id":       "nuhi-jiwk",
+        "name":     "FDNY Incidents (fire/EMS)",
+        "agency":   "FDNY",
+        "lat_col":  "latitude",
+        "lng_col":  "longitude",
+        "label_col":"incident_type_desc",
+        "desc":     "FDNY incident data — fire, EMS, hazmat",
+        "color":    "#f87171",
+        "icon":     "🚒",
+        "filter":   None,
+    },
+    {
+        "id":       "2bnn-yakx",
+        "name":     "NYC Cooling Centers",
+        "agency":   "DOHMH",
+        "lat_col":  "latitude",
+        "lng_col":  "longitude",
+        "label_col":"site_name",
+        "desc":     "Active cooling center locations during heat emergencies",
+        "color":    "#34d399",
+        "icon":     "❄️",
+        "filter":   None,
+    },
+    {
+        "id":       "uqnk-2pcv",
+        "name":     "Hurricane Evacuation Centers",
+        "agency":   "OEM",
+        "lat_col":  "latitude",
+        "lng_col":  "longitude",
+        "label_col":"facility_name",
+        "desc":     "Designated hurricane evacuation shelter locations",
+        "color":    "#facc15",
+        "icon":     "🏫",
+        "filter":   None,
+    },
+    {
+        "id":       "43nn-pn8y",
+        "name":     "NYPD Incidents",
+        "agency":   "NYPD",
+        "lat_col":  "latitude",
+        "lng_col":  "longitude",
+        "label_col":"ofns_desc",
+        "desc":     "NYPD incident reports — filterable by type and date",
+        "color":    "#a78bfa",
+        "icon":     "🚔",
+        "filter":   None,
+    },
+    {
+        "id":       "5uac-w243",
+        "name":     "NYCHA Developments",
+        "agency":   "NYCHA",
+        "lat_col":  "latitude",
+        "lng_col":  "longitude",
+        "label_col":"development",
+        "desc":     "NYCHA public housing developments — vulnerable population locations",
+        "color":    "#fb923c",
+        "icon":     "🏢",
+        "filter":   None,
+    },
+]
+
+def search_nyc_open_data(query: str, app_token: str = "", limit: int = 20) -> list[dict]:
+    """Search the NYC Open Data catalog using the Socrata catalog API."""
+    try:
+        params = {"q": query, "limit": limit, "only": "dataset"}
+        headers = {}
+        if app_token:
+            headers["X-App-Token"] = app_token
+        r = requests.get(
+            "https://data.cityofnewyork.us/api/catalog/v1",
+            params=params, headers=headers, timeout=10
+        )
+        r.raise_for_status()
+        results = r.json().get("results", [])
+        return [
+            {
+                "id":          d.get("resource", {}).get("id", ""),
+                "name":        d.get("resource", {}).get("name", ""),
+                "description": d.get("resource", {}).get("description", "")[:300],
+                "agency":      d.get("classification", {}).get("owning_department", ""),
+                "category":    d.get("classification", {}).get("categories", [""])[0] if d.get("classification", {}).get("categories") else "",
+                "updated":     d.get("resource", {}).get("updatedAt", "")[:10],
+                "columns":     d.get("resource", {}).get("columns_name", []),
+                "permalink":   d.get("permalink", ""),
+            }
+            for d in results if d.get("resource", {}).get("id")
+        ]
+    except Exception as e:
+        return []
+
+def fetch_socrata_dataset(
+    dataset_id: str,
+    app_token: str = "",
+    lat_col: str = "latitude",
+    lng_col: str = "longitude",
+    label_col: str = "",
+    where_clause: str = "",
+    limit: int = 500,
+) -> dict:
+    """
+    Fetch rows from a Socrata dataset and return as a mappable dict.
+    Uses the v2 /resource/ endpoint (GeoJSON output).
+    Returns {"features": [...], "error": None} where each feature has lat/lng/label/props.
+    """
+    headers = {"Accept": "application/json"}
+    if app_token:
+        headers["X-App-Token"] = app_token
+
+    params = {"$limit": limit, "$order": ":id"}
+    if where_clause:
+        params["$where"] = where_clause
+
+    try:
+        url = f"https://data.cityofnewyork.us/resource/{dataset_id}.json"
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        r.raise_for_status()
+        rows = r.json()
+
+        features = []
+        skipped  = 0
+        for row in rows:
+            # Try to get lat/lng — could be in dedicated columns or in a location object
+            lat, lng = None, None
+            if lat_col in row and lng_col in row:
+                try:
+                    lat = float(row[lat_col])
+                    lng = float(row[lng_col])
+                except (TypeError, ValueError):
+                    pass
+            # Fallback: look for a .location dict
+            if lat is None:
+                for key in ("location", "geocoded_column", "the_geom"):
+                    loc = row.get(key, {})
+                    if isinstance(loc, dict):
+                        try:
+                            lat = float(loc.get("latitude") or loc.get("coordinates", [None, None])[1])
+                            lng = float(loc.get("longitude") or loc.get("coordinates", [None, None])[0])
+                            break
+                        except (TypeError, ValueError, IndexError):
+                            pass
+            if lat is None or lng is None or lat == 0 or lng == 0:
+                skipped += 1
+                continue
+
+            label = str(row.get(label_col, "")) if label_col else ""
+            features.append({"lat": lat, "lng": lng, "label": label, "props": row})
+
+        return {
+            "features":    features,
+            "total_rows":  len(rows),
+            "skipped":     skipped,
+            "dataset_id":  dataset_id,
+            "error":       None,
+        }
+    except Exception as e:
+        return {"features": [], "total_rows": 0, "skipped": 0, "dataset_id": dataset_id, "error": str(e)}
+
+def socrata_popup_html(feature: dict, label_col: str, dataset_name: str, color: str) -> str:
+    """Build a Folium popup for a Socrata data point."""
+    props = feature["props"]
+    label = feature["label"] or dataset_name
+
+    # Top fields to show (skip long/system fields)
+    skip_keys = {"latitude", "longitude", "location", "the_geom", "geocoded_column",
+                 ":id", "@id", "x_coordinate_state_plane", "y_coordinate_state_plane"}
+    show_props = {k: v for k, v in props.items()
+                  if k not in skip_keys and not k.startswith(":") and v not in (None, "", [])}
+    # Limit to 8 most informative fields
+    show_props = dict(list(show_props.items())[:8])
+
+    rows_html = "".join(
+        f'<div style="margin-bottom:2px"><span style="color:#556">{k}:</span> '
+        f'<span style="color:#aab">{str(v)[:80]}</span></div>'
+        for k, v in show_props.items()
+    )
+    return (f'<div style="font-family:monospace;font-size:10px;max-width:250px">'
+            f'<div style="font-weight:700;color:{color};margin-bottom:5px;font-size:11px">{label[:60]}</div>'
+            f'{rows_html}'
+            f'<div style="color:#446;font-size:9px;margin-top:4px;border-top:1px solid #1e2a40;padding-top:3px">'
+            f'NYC Open Data · {dataset_name}</div>'
+            f'</div>')
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ESRI FEATURE SERVICE → MAP HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def fetch_esri_feature_layer(service_url: str, max_features: int = 500) -> dict:
+    """
+    Query an ArcGIS Feature Service REST endpoint and return GeoJSON-like features.
+    Works with any public ArcGIS Feature Service — no auth required.
+    Appends /query if not already present.
+    """
+    # Normalize URL — ensure we hit the /query endpoint
+    base = service_url.rstrip("/")
+    if not base.endswith("/query"):
+        # If it's an item URL (arcgis.com/home/item.html?id=...), can't query directly
+        if "arcgis.com/home/item" in base:
+            return {"features": [], "error": "Item page URL — use the Service URL (REST endpoint), not the item page URL"}
+        query_url = base + "/query"
+    else:
+        query_url = base
+
+    params = {
+        "where":        "1=1",
+        "outFields":    "*",
+        "returnGeometry": "true",
+        "f":            "geojson",
+        "resultRecordCount": max_features,
+    }
+    try:
+        r = requests.get(query_url, params=params, timeout=15,
+                         headers={"User-Agent": "EMBER/1.0"})
+        r.raise_for_status()
+        geojson = r.json()
+
+        if "error" in geojson:
+            return {"features": [], "error": geojson["error"].get("message", "ArcGIS error")}
+
+        features = []
+        for feat in geojson.get("features", []):
+            geom = feat.get("geometry", {})
+            props = feat.get("properties", {})
+            gtype = geom.get("type", "")
+
+            if gtype == "Point":
+                coords = geom.get("coordinates", [])
+                if len(coords) >= 2:
+                    features.append({"type": "point", "lat": coords[1], "lng": coords[0], "props": props})
+            elif gtype in ("Polygon", "MultiPolygon"):
+                features.append({"type": "polygon", "geometry": geom, "props": props})
+            elif gtype in ("LineString", "MultiLineString"):
+                features.append({"type": "line", "geometry": geom, "props": props})
+
+        return {"features": features, "total": len(features), "error": None}
+    except Exception as e:
+        return {"features": [], "total": 0, "error": str(e)}
+
+def esri_feature_popup_html(feature: dict, layer_name: str, color: str) -> str:
+    """Build a Folium popup for an ESRI feature."""
+    props = feature["props"]
+    skip  = {"OBJECTID", "ObjectID", "FID", "Shape_Area", "Shape_Length", "GlobalID"}
+    show  = {k: v for k, v in props.items() if k not in skip and v not in (None, "")}
+    rows  = "".join(
+        f'<div><span style="color:#556">{k}:</span> <span style="color:#aab">{str(v)[:80]}</span></div>'
+        for k, v in list(show.items())[:8]
+    )
+    name = next((str(v) for k, v in show.items() if any(x in k.upper() for x in ("NAME","TITLE","LABEL","DESC","SITE"))), layer_name)
+    return (f'<div style="font-family:monospace;font-size:10px;max-width:240px">'
+            f'<div style="font-weight:700;color:{color};margin-bottom:4px;font-size:11px">{name[:60]}</div>'
+            f'{rows}'
+            f'<div style="color:#446;font-size:9px;margin-top:4px;border-top:1px solid #1e2a40;padding-top:3px">'
+            f'ESRI Feature Layer · {layer_name}</div>'
+            f'</div>')
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SESSION STATE INIT
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -625,6 +1009,7 @@ for k, v in [
                         f"EMBER initialized — Emergency Management Body of Evidence & Resources\n"
                         f"Backend: Ollama Cloud · {OLLAMA_MODEL}\nJurisdiction: New York City\n\n"
                         f"Knowledge base loaded · NOAA feeds auto-fetching · Radar & wind on by default\n"
+                        f"Tidal gauges: fetching live CO-OPS water levels for all NY stations\n"
                         f"Click a map marker or type a query to begin."}]),
     ("files",        []),
     ("api_results",  []),
@@ -636,6 +1021,11 @@ for k, v in [
     ("noaa_items",   []),
     ("show_radar",   True),
     ("show_wind",    True),
+    ("gauge_data",   {}),       # live tidal gauge readings keyed by station_id
+    ("gauge_stations", []),     # CO-OPS station list for NY (dynamic)
+    ("gauge_fetched_at", None), # last fetch timestamp
+    ("map_layers",  []),        # user-added map layers: [{id, name, type, color, icon, features, ...}]
+    ("nyc_token",   ""),        # NYC Open Data app token (user-provided)
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -656,6 +1046,17 @@ _wind_age = (_dt.datetime.now() - st.session_state.get("wind_obs_fetched_at", _d
 if _wind_age > 300:
     st.session_state.wind_obs            = fetch_wind_obs()
     st.session_state.wind_obs_fetched_at = _dt.datetime.now()
+
+# Refresh tidal gauges if stale (>6 min — CO-OPS updates every 6 min)
+_gauge_age = (_dt.datetime.now() - st.session_state.get("gauge_fetched_at", _dt.datetime.min)).total_seconds()
+if _gauge_age > 360 or not st.session_state.gauge_data:
+    # Fetch station list once
+    if not st.session_state.gauge_stations:
+        st.session_state.gauge_stations = fetch_station_list("NY")
+    # Fetch live data for all key NYC stations (+ any others in session)
+    station_ids = list(FLOOD_THRESHOLDS.keys())
+    st.session_state.gauge_data       = fetch_all_ny_gauges(station_ids)
+    st.session_state.gauge_fetched_at = _dt.datetime.now()
 
 # Seed map-connected NOAA endpoints and refresh stale ones
 auto_fetch_map_endpoints()
@@ -695,6 +1096,29 @@ with st.sidebar:
                              help="Live NWS surface obs — refreshes every 5min automatically")
 
     st.divider()
+    st.markdown("**TIDAL GAUGES**")
+    g_fetched = st.session_state.get("gauge_fetched_at")
+    g_age_s   = int((_dt.datetime.now() - g_fetched).total_seconds()) if g_fetched else None
+    g_age_str = f"last fetched {g_age_s//60}m ago" if g_age_s else "not yet fetched"
+    st.caption(f"CO-OPS · auto-refresh 6min · {g_age_str}")
+    if st.button("↺ Refresh Gauges Now", use_container_width=True):
+        with st.spinner("Fetching live gauge data…"):
+            st.session_state.gauge_data       = fetch_all_ny_gauges(list(FLOOD_THRESHOLDS.keys()))
+            st.session_state.gauge_fetched_at = _dt.datetime.now()
+        st.rerun()
+    # Show current flood status for each gauge
+    for sid, gd in st.session_state.gauge_data.items():
+        ld = gd.get("level")
+        if not ld: continue
+        color = ld.get("color","#4ade80")
+        st.markdown(
+            f'<span class="pill" style="background:{color}18;color:{color};border:1px solid {color}33">'
+            f'● {ld.get("station_name","?")[:18]}: {ld.get("level_ft","?")}ft — {ld.get("status","?")}'
+            f'</span>',
+            unsafe_allow_html=True
+        )
+
+    st.divider()
     st.markdown("**LIVE FEEDS** (sidebar)")
     if st.button("↺ Fetch All Feeds", use_container_width=True):
         with st.spinner("Fetching…"):
@@ -732,6 +1156,39 @@ with st.sidebar:
 
 st.markdown("### 🗺️ NYC Operational Map")
 
+# ── Tidal gauge live status strip ──────────────────────────────────────────────
+gauge_data = st.session_state.gauge_data
+if gauge_data:
+    gauge_fetched = st.session_state.get("gauge_fetched_at")
+    g_age_s = int((_dt.datetime.now() - gauge_fetched).total_seconds()) if gauge_fetched else None
+    g_age_str = f"{g_age_s//60}m{g_age_s%60:02d}s ago" if g_age_s is not None else "?"
+    st.markdown(
+        f"**🌊 Live Tidal Gauges (CO-OPS)** "
+        f"<span style='font-size:11px;color:#446'>· {g_age_str} · auto-refreshes every 6min</span>",
+        unsafe_allow_html=True
+    )
+    gcols = st.columns(min(len(gauge_data), 6))
+    for i, (sid, gd) in enumerate(gauge_data.items()):
+        ld = gd.get("level")
+        if not ld: continue
+        with gcols[i % 6]:
+            color  = ld.get("color", "#4ade80")
+            status = ld.get("status", "NORMAL")
+            lft    = ld.get("level_ft", 0)
+            name   = ld.get("station_name", sid)
+            nh     = gd.get("next_high")
+            st.markdown(
+                f'<div style="background:#0d1520;border:1px solid {color}44;border-radius:6px;'
+                f'padding:8px 10px;font-family:monospace">'
+                f'<div style="font-size:9px;color:#556;margin-bottom:2px">{name}</div>'
+                f'<div style="font-size:18px;font-weight:700;color:{color}">{lft:.2f}ft</div>'
+                f'<div style="font-size:9px;color:{color}">{status}</div>'
+                f'<div style="font-size:8px;color:#446;margin-top:3px">{ld.get("trend_str","")}</div>'
+                f'{f"""<div style="font-size:8px;color:#60a5fa;margin-top:2px">▲ {nh["level_ft"]:.2f}ft @ {nh["time"][-5:]}</div>""" if nh else ""}'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
 wind_obs = st.session_state.get("wind_obs", []) if show_wind else []
 
 if show_wind and wind_obs:
@@ -755,9 +1212,27 @@ if show_wind and wind_obs:
                 delta_color="off"
             )
 
+if st.session_state.map_layers:
+    n_layers = len(st.session_state.map_layers)
+    st.markdown(f"**🗂 Active User Layers ({n_layers})**", unsafe_allow_html=True)
+    layer_cols = st.columns(min(n_layers, 4))
+    for i, layer in enumerate(st.session_state.map_layers):
+        with layer_cols[i % 4]:
+            color = layer.get("color","#60a5fa")
+            st.markdown(
+                f'<div style="background:{color}12;border:1px solid {color}44;border-radius:5px;'
+                f'padding:5px 8px;font-family:monospace;font-size:10px">'
+                f'<span style="color:{color};font-weight:700">{layer["icon"]} {layer["name"][:28]}</span><br>'
+                f'<span style="color:#446">{layer["count"]} features · {layer["type"].upper()}</span>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
 if show_radar:
     next_refresh = 300 - (int(_time.time()) % 300)
     st.caption(f"📡 NEXRAD radar active — next tile refresh in ~{next_refresh}s · Iowa State MESONET")
+
+
 
 live_rdgs = {
     **build_live_readings(st.session_state.api_results),
@@ -770,7 +1245,9 @@ if "__flood_alert__" in live_rdgs:
 
 map_data = st_folium(
     build_map(active_layers, show_radar=show_radar, show_wind=show_wind,
-              wind_obs=wind_obs, live_readings=live_rdgs),
+              wind_obs=wind_obs, live_readings=live_rdgs,
+              gauge_data=st.session_state.gauge_data,
+              map_layers=st.session_state.map_layers),
     width="100%", height=380, returned_objects=["last_object_clicked_popup"]
 )
 
@@ -785,7 +1262,12 @@ st.markdown("---")
 # TABS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-tab_chat, tab_noaa, tab_esri = st.tabs(["💬 EMBER Chat", "📡 NOAA Data Stack", "⊕ ESRI / Living Atlas"])
+tab_chat, tab_noaa, tab_nyc, tab_esri = st.tabs([
+    "💬 EMBER Chat",
+    "📡 NOAA Data Stack",
+    "🗽 NYC Open Data",
+    "⊕ ESRI / Living Atlas",
+])
 
 # ── NOAA Tab ──────────────────────────────────────────────────────────────────
 with tab_noaa:
@@ -874,7 +1356,243 @@ with tab_noaa:
                     st.session_state.noaa_items.pop(i)
                     st.rerun()
 
-# ── ESRI Tab ──────────────────────────────────────────────────────────────────
+# ── NYC Open Data Tab ─────────────────────────────────────────────────────────
+with tab_nyc:
+    st.markdown("#### 🗽 NYC Open Data")
+    st.caption("Powered by Socrata SODA API · data.cityofnewyork.us · App token recommended (free at opendata.cityofnewyork.us)")
+
+    # ── Token input ────────────────────────────────────────────────────────────
+    with st.expander("🔑 NYC Open Data App Token (optional but recommended)", expanded=not st.session_state.nyc_token):
+        st.markdown(
+            "An app token removes rate limits. Get one free at "
+            "[opendata.cityofnewyork.us](https://opendata.cityofnewyork.us/) → Sign In → Manage → App Tokens"
+        )
+        token_input = st.text_input("Paste your app token", value=st.session_state.nyc_token,
+                                     type="password", key="nyc_token_input",
+                                     placeholder="e.g. aBcDeFgHiJkLmNoP123456789")
+        if st.button("Save Token", key="save_nyc_token"):
+            st.session_state.nyc_token = token_input
+            st.success("Token saved for this session.")
+
+    nyc_token = st.session_state.nyc_token
+
+    st.divider()
+
+    # ── Preset emergency datasets ──────────────────────────────────────────────
+    st.markdown("**Emergency-Relevant Datasets (one-click)**")
+    st.caption("Click ▶ to fetch and add directly to the map. Data is sampled (up to 500 records).")
+
+    preset_cols = st.columns(3)
+    for pi, preset in enumerate(NYC_OPEN_DATA_PRESETS):
+        with preset_cols[pi % 3]:
+            already_on_map = any(l["id"] == f"nyc_{preset['id']}" for l in st.session_state.map_layers)
+            st.markdown(
+                f'<div class="esri-card" style="border-left:3px solid {preset["color"]};min-height:90px">'
+                f'<div style="font-weight:700;color:{preset["color"]};margin-bottom:2px">{preset["icon"]} {preset["name"]}</div>'
+                f'<div style="font-size:9px;color:#556;margin-bottom:4px">{preset["agency"]} · {preset["id"]}</div>'
+                f'<div style="font-size:10px;color:#778">{preset["desc"][:80]}</div>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+            if already_on_map:
+                if st.button(f"✓ On Map", key=f"preset_rm_{preset['id']}", use_container_width=True):
+                    st.session_state.map_layers = [l for l in st.session_state.map_layers if l["id"] != f"nyc_{preset['id']}"]
+                    st.rerun()
+            else:
+                if st.button(f"▶ Add to Map", key=f"preset_add_{preset['id']}", use_container_width=True):
+                    with st.spinner(f"Fetching {preset['name']}…"):
+                        result = fetch_socrata_dataset(
+                            preset["id"], nyc_token,
+                            lat_col=preset["lat_col"], lng_col=preset["lng_col"],
+                            label_col=preset["label_col"], limit=500
+                        )
+                    if result["error"]:
+                        st.error(f"Error: {result['error']}")
+                    elif not result["features"]:
+                        st.warning(f"No mappable records returned (dataset may lack lat/lng in recent records)")
+                    else:
+                        color   = preset["color"]
+                        def make_popup_fn(ds_name, col, clr):
+                            def fn(feat):
+                                return socrata_popup_html(feat, col, ds_name, clr)
+                            return fn
+                        st.session_state.map_layers.append({
+                            "id":       f"nyc_{preset['id']}",
+                            "name":     preset["name"],
+                            "type":     "socrata",
+                            "color":    color,
+                            "icon":     preset["icon"],
+                            "features": result["features"],
+                            "visible":  True,
+                            "popup_fn": make_popup_fn(preset["name"], preset["label_col"], color),
+                            "count":    len(result["features"]),
+                            "source":   f"NYC Open Data · {preset['id']}",
+                        })
+                        st.success(f"✓ Added {len(result['features'])} features to map")
+                        st.rerun()
+
+    st.divider()
+
+    # ── Custom dataset search ──────────────────────────────────────────────────
+    st.markdown("**Search NYC Open Data Catalog**")
+    sc1, sc2 = st.columns([4, 1])
+    with sc1: nyc_query  = st.text_input("Search datasets…", placeholder="flood zones, shelters, hospitals, 311, FDNY…", key="nyc_query")
+    with sc2: do_nyc_search = st.button("🔍 Search", use_container_width=True, key="nyc_search_btn")
+
+    if do_nyc_search and nyc_query:
+        with st.spinner("Searching NYC Open Data catalog…"):
+            nyc_results = search_nyc_open_data(nyc_query, nyc_token, limit=15)
+        st.session_state["nyc_search_results"] = nyc_results
+        st.session_state["nyc_search_query"]   = nyc_query
+
+    if st.session_state.get("nyc_search_results"):
+        results  = st.session_state["nyc_search_results"]
+        st.caption(f"{len(results)} datasets found for '{st.session_state.get('nyc_search_query','')}'")
+
+        for ds in results:
+            cols_str = ", ".join(ds["columns"][:6]) if ds["columns"] else "—"
+            has_geo  = any(c.lower() in ("latitude","longitude","the_geom","location","geocoded_column")
+                          for c in (ds["columns"] or []))
+            geo_badge = '<span class="pill p-green">📍 mappable</span>' if has_geo else '<span class="pill p-yellow">⚠ no geometry</span>'
+
+            st.markdown(f"""<div class="esri-card">
+                <div style="display:flex;justify-content:space-between;align-items:flex-start">
+                  <div>
+                    <div style="font-weight:700;color:#dde;margin-bottom:2px">{ds['name']}</div>
+                    <div style="font-size:9px;color:#556;margin-bottom:4px">
+                      {ds['agency']} · {ds['category']} · updated {ds['updated']} · ID: <code>{ds['id']}</code>
+                    </div>
+                    <div style="font-size:10px;color:#778;margin-bottom:4px">{ds['description'][:120]}</div>
+                    <div style="font-size:9px;color:#446">Columns: {cols_str}</div>
+                  </div>
+                  <div>{geo_badge}</div>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+            if has_geo:
+                ncola, ncolb, ncolc = st.columns([2, 2, 2])
+                with ncola:
+                    lat_guess  = next((c for c in (ds["columns"] or []) if "lat" in c.lower()), "latitude")
+                    lng_guess  = next((c for c in (ds["columns"] or []) if "lon" in c.lower() or "lng" in c.lower()), "longitude")
+                    label_guess= next((c for c in (ds["columns"] or []) if any(x in c.lower() for x in ("name","type","desc","title"))), "")
+                    lat_col_in = st.text_input("Lat column", value=lat_guess, key=f"lat_{ds['id']}")
+                with ncolb:
+                    lng_col_in = st.text_input("Lng column", value=lng_guess, key=f"lng_{ds['id']}")
+                with ncolc:
+                    lbl_col_in = st.text_input("Label column", value=label_guess, key=f"lbl_{ds['id']}")
+
+                on_map = any(l["id"] == f"nyc_{ds['id']}" for l in st.session_state.map_layers)
+                if on_map:
+                    if st.button(f"✕ Remove from Map", key=f"rm_{ds['id']}", use_container_width=True):
+                        st.session_state.map_layers = [l for l in st.session_state.map_layers if l["id"] != f"nyc_{ds['id']}"]
+                        st.rerun()
+                else:
+                    if st.button(f"▶ Add '{ds['name'][:30]}' to Map", key=f"add_{ds['id']}", use_container_width=True):
+                        with st.spinner(f"Fetching {ds['name']}…"):
+                            result = fetch_socrata_dataset(
+                                ds["id"], nyc_token,
+                                lat_col=lat_col_in, lng_col=lng_col_in,
+                                label_col=lbl_col_in, limit=500
+                            )
+                        if result["error"]:
+                            st.error(f"Error: {result['error']}")
+                        elif not result["features"]:
+                            st.warning("No mappable records — check lat/lng column names")
+                        else:
+                            color   = "#60a5fa"
+                            def make_popup_fn2(dname, lcol, clr):
+                                def fn(feat): return socrata_popup_html(feat, lcol, dname, clr)
+                                return fn
+                            st.session_state.map_layers.append({
+                                "id":       f"nyc_{ds['id']}",
+                                "name":     ds["name"],
+                                "type":     "socrata",
+                                "color":    color,
+                                "icon":     "🗽",
+                                "features": result["features"],
+                                "visible":  True,
+                                "popup_fn": make_popup_fn2(ds["name"], lbl_col_in, color),
+                                "count":    len(result["features"]),
+                                "source":   f"NYC Open Data · {ds['id']}",
+                            })
+                            st.success(f"✓ Added {len(result['features'])} features to map")
+                            st.rerun()
+            else:
+                if ds.get("permalink"):
+                    st.link_button("↗ View on NYC Open Data", ds["permalink"])
+
+            st.markdown("---")
+
+    st.divider()
+
+    # ── Custom endpoint ────────────────────────────────────────────────────────
+    st.markdown("**Custom Dataset URL**")
+    st.caption("Paste any NYC Open Data resource URL or dataset ID to fetch and map it")
+    ccol1, ccol2 = st.columns([3, 1])
+    with ccol1:
+        custom_id = st.text_input("Dataset ID or URL", placeholder="e.g. fhrw-4uyv or https://data.cityofnewyork.us/resource/fhrw-4uyv.json", key="nyc_custom_id")
+    with ccol2:
+        custom_lat = st.text_input("Lat col", value="latitude", key="nyc_custom_lat")
+
+    ccol3, ccol4, ccol5 = st.columns([1, 1, 2])
+    with ccol3: custom_lng   = st.text_input("Lng col", value="longitude", key="nyc_custom_lng")
+    with ccol4: custom_label = st.text_input("Label col", value="", key="nyc_custom_label")
+    with ccol5:
+        custom_where = st.text_input("WHERE filter (optional SoQL)", placeholder="status='Active'", key="nyc_custom_where")
+
+    if st.button("▶ Fetch & Add to Map", key="nyc_custom_fetch", use_container_width=True) and custom_id:
+        # Extract ID from URL if needed
+        ds_id = custom_id.strip()
+        if "/" in ds_id:
+            ds_id = ds_id.rstrip("/").split("/")[-1].replace(".json","").replace(".geojson","")
+        with st.spinner("Fetching dataset…"):
+            result = fetch_socrata_dataset(
+                ds_id, nyc_token,
+                lat_col=custom_lat, lng_col=custom_lng,
+                label_col=custom_label, where_clause=custom_where, limit=500
+            )
+        if result["error"]:
+            st.error(f"Error: {result['error']}")
+        elif not result["features"]:
+            st.warning(f"No mappable records returned. Fetched {result['total_rows']} rows but {result['skipped']} lacked valid lat/lng.")
+        else:
+            color = "#f472b6"
+            def make_custom_popup(lcol, clr):
+                def fn(feat): return socrata_popup_html(feat, lcol, ds_id, clr)
+                return fn
+            st.session_state.map_layers.append({
+                "id":       f"nyc_{ds_id}",
+                "name":     f"NYC OD: {ds_id}",
+                "type":     "socrata",
+                "color":    color,
+                "icon":     "🗽",
+                "features": result["features"],
+                "visible":  True,
+                "popup_fn": make_custom_popup(custom_label, color),
+                "count":    len(result["features"]),
+                "source":   f"NYC Open Data · {ds_id}",
+            })
+            st.success(f"✓ Added {len(result['features'])} features to map")
+            st.rerun()
+
+    # ── Active map layers ──────────────────────────────────────────────────────
+    nyc_active = [l for l in st.session_state.map_layers if l["type"] == "socrata"]
+    if nyc_active:
+        st.divider()
+        st.markdown(f"**{len(nyc_active)} NYC Open Data layer(s) on map:**")
+        for i, layer in enumerate(nyc_active):
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                st.markdown(
+                    f'<span class="pill p-blue">{layer["icon"]} {layer["name"][:50]} · {layer["count"]} features</span>',
+                    unsafe_allow_html=True
+                )
+            with c2:
+                if st.button("✕", key=f"rm_nyc_layer_{i}"):
+                    st.session_state.map_layers = [l for l in st.session_state.map_layers if l["id"] != layer["id"]]
+                    st.rerun()
+
+# ── ESRI Tab ───────────────────────────────────────────────────────────────────
 with tab_esri:
     st.markdown("#### Search ArcGIS Online & Living Atlas")
     st.caption("Public layers, no authentication required. Inject metadata into the EMBER knowledge base.")
@@ -954,6 +1672,46 @@ with tab_esri:
                 with cd:
                     if item.get("url"): st.link_button("↗ Service", item["url"])
 
+                # Add to Map button — only for Feature Layers / Map Services with a URL
+                if item.get("url") and item.get("type") in ("Feature Layer", "Feature Service", "Map Service"):
+                    esri_on_map = any(l["id"] == f"esri_{item['id']}" for l in st.session_state.map_layers)
+                    if esri_on_map:
+                        if st.button(f"✕ Remove from Map", key=f"esri_rm_map_{item['id']}", use_container_width=True):
+                            st.session_state.map_layers = [l for l in st.session_state.map_layers if l["id"] != f"esri_{item['id']}"]
+                            st.rerun()
+                    else:
+                        if st.button(f"🗺 Add to Map", key=f"esri_map_{item['id']}", use_container_width=True):
+                            service_url = item["url"]
+                            # Append /0 if it's a service root, not a layer
+                            if "/FeatureServer" in service_url and not service_url.split("/FeatureServer")[-1].strip("/").isdigit():
+                                service_url = service_url.rstrip("/") + "/0"
+                            with st.spinner(f"Fetching {item.get('title','')} layer…"):
+                                result = fetch_esri_feature_layer(service_url, max_features=500)
+                            if result["error"]:
+                                st.error(f"Error fetching layer: {result['error']}")
+                            elif not result["features"]:
+                                st.warning("No features returned — layer may be empty or require authentication")
+                            else:
+                                color  = "#a78bfa"
+                                iname  = item.get("title", item["id"])
+                                def make_esri_popup(nm, clr):
+                                    def fn(feat): return esri_feature_popup_html(feat, nm, clr)
+                                    return fn
+                                st.session_state.map_layers.append({
+                                    "id":        f"esri_{item['id']}",
+                                    "name":      iname,
+                                    "type":      "esri",
+                                    "color":     color,
+                                    "icon":      "⊕",
+                                    "features":  result["features"],
+                                    "visible":   True,
+                                    "popup_fn":  make_esri_popup(iname, color),
+                                    "count":     result["total"],
+                                    "source":    f"ESRI · {service_url}",
+                                })
+                                st.success(f"✓ Added {result['total']} features to map")
+                                st.rerun()
+
     if st.session_state.esri_items:
         st.divider()
         st.markdown(f"**{len(st.session_state.esri_items)} ESRI layer(s) in KB:**")
@@ -963,6 +1721,20 @@ with tab_esri:
             with c2:
                 if st.button("✕", key=f"rm_esri_{i}"):
                     st.session_state.esri_items.pop(i)
+                    st.rerun()
+
+    # ESRI layers currently on map
+    esri_map_layers = [l for l in st.session_state.map_layers if l["type"] == "esri"]
+    if esri_map_layers:
+        st.divider()
+        st.markdown(f"**{len(esri_map_layers)} ESRI layer(s) on map:**")
+        for i, layer in enumerate(esri_map_layers):
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                st.markdown(f'<span class="pill p-purple">⊕ {layer["name"][:50]} · {layer["count"]} features</span>', unsafe_allow_html=True)
+            with c2:
+                if st.button("✕", key=f"rm_esri_map_{i}"):
+                    st.session_state.map_layers = [l for l in st.session_state.map_layers if l["id"] != layer["id"]]
                     st.rerun()
 
 # ── Chat Tab ──────────────────────────────────────────────────────────────────
@@ -994,7 +1766,8 @@ with tab_chat:
         ctx  = build_context(
             st.session_state.files, st.session_state.api_results,
             active_kb, st.session_state.esri_items,
-            st.session_state.get("noaa_items", [])
+            st.session_state.get("noaa_items", []),
+            st.session_state.get("gauge_data", {}),
         )
         msgs = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages[-10:]]
         with st.chat_message("assistant"):
