@@ -8,7 +8,7 @@ Setup:
     streamlit run streamlit/app.py
 """
 
-import json, os, re
+import json, os, re, time as _time, datetime as _dt
 from io import StringIO
 import folium, requests, streamlit as st
 from streamlit_folium import st_folium
@@ -285,7 +285,6 @@ def build_map(active_layers, show_radar=False, show_wind=False, wind_obs=None, l
     if show_radar:
         # Cache-bust every 5 minutes so browsers fetch fresh tiles from MESONET.
         # MESONET updates composites every ~5min; floor to nearest 5min epoch.
-        import time as _time
         epoch_5min = int(_time.time() // 300)
         folium.TileLayer(
             tiles=f"https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/{{z}}/{{x}}/{{y}}.png?_={epoch_5min}",
@@ -470,8 +469,7 @@ if show_wind and wind_obs:
             )
 
 if show_radar:
-    import time as _time2
-    next_refresh = 300 - (int(_time2.time()) % 300)
+    next_refresh = 300 - (int(_time.time()) % 300)
     st.caption(f"📡 NEXRAD radar active — tiles refresh every 5min · next refresh in ~{next_refresh}s · Iowa State MESONET")
 
 # Flood alert banner
@@ -527,7 +525,6 @@ NOAA_ENDPOINTS_FLAT = [
     {"id":"swpc_kp",          "cat":"SWPC",  "color":"#a78bfa","icon":"☀️","name":"Planetary K-Index (1-min)",          "url":"https://services.swpc.noaa.gov/json/planetary_k_index_1m.json",                                                                        "desc":"1-minute Kp index — geomagnetic disturbance level",                      "tags":["Kp index","geomagnetic"]},
 ]
 
-import datetime as _dt
 
 # ── Endpoints that feed the map directly ──────────────────────────────────────
 # These are auto-fetched on load and auto-refreshed every N seconds.
