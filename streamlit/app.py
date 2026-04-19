@@ -216,8 +216,49 @@ def format_item_for_context(item, data=None):
             block += "\n  Operational Layers: " + ", ".join(l.get("title","?") for l in data["operationalLayers"])
     return block
 
-def build_map(active_layers):
-    m = folium.Map(location=[40.7128,-74.006], zoom_start=11, tiles="CartoDB dark_matter", prefer_canvas=True)
+def fetch_wind_obs():
+    """Fetch current wind and precip obs from NWS for NYC-area stations."""
+    stations = [
+        {"id":"KNYC","name":"Central Park","lat":40.7789,"lng":-73.9692},
+        {"id":"KJFK","name":"JFK Airport","lat":40.6413,"lng":-73.7781},
+        {"id":"KEWR","name":"Newark","lat":40.6895,"lng":-74.1745},
+        {"id":"KLGA","name":"LaGuardia","lat":40.7772,"lng":-73.8726},
+    ]
+    results = []
+    for s in stations:
+        try:
+            r = requests.get(
+                f"https://api.weather.gov/stations/{s['id']}/observations/latest",
+                timeout=6, headers={"User-Agent":"EMBER/1.0"}
+            )
+            if not r.ok: continue
+            p = r.json()["properties"]
+            speed_mph = round(p["windSpeed"]["value"] * 0.621371, 0) if p.get("windSpeed",{}).get("value") is not None else None
+            gust_mph  = round(p["windGust"]["value"]  * 0.621371, 0) if p.get("windGust",{}).get("value")  is not None else None
+            dir_deg   = p.get("windDirection",{}).get("value")
+            temp_f    = round(p["temperature"]["value"] * 9/5 + 32, 0) if p.get("temperature",{}).get("value") is not None else None
+            precip_in = round(p["precipitationLastHour"]["value"] * 0.0393701, 2) if p.get("precipitationLastHour",{}).get("value") is not None else None
+            results.append({**s, "speed_mph":speed_mph, "gust_mph":gust_mph,
+                             "dir_deg":dir_deg, "temp_f":temp_f,
+                             "precip_in":precip_in, "desc":p.get("textDescription","")})
+        except: continue
+    return results
+
+def build_map(active_layers, show_radar=False, show_wind=False, wind_obs=None):
+    m = folium.Map(location=[40.7128,-74.006], zoom_start=10, tiles="CartoDB dark_matter", prefer_canvas=True)
+
+    # ── NEXRAD radar tile overlay ──────────────────────────────────────────────
+    if show_radar:
+        folium.TileLayer(
+            tiles="https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/{z}/{x}/{y}.png",
+            name="NEXRAD Radar",
+            attr='NEXRAD &copy; Iowa State MESONET',
+            opacity=0.65,
+            overlay=True,
+            control=True,
+        ).add_to(m)
+
+    # ── Marker layers ──────────────────────────────────────────────────────────
     for key, layer in MAP_POINTS.items():
         if key not in active_layers: continue
         fg = folium.FeatureGroup(name=layer["label"])
@@ -227,6 +268,41 @@ def build_map(active_layers):
                 popup=folium.Popup(f'<div style="font-family:monospace;font-size:11px"><b style="color:{layer["color"]}">{f["name"]}</b><br>{f["note"]}</div>', max_width=220),
                 tooltip=f["name"]).add_to(fg)
         fg.add_to(m)
+
+    # ── Wind observation arrows ────────────────────────────────────────────────
+    if show_wind and wind_obs:
+        wind_fg = folium.FeatureGroup(name="Wind Observations")
+        for o in wind_obs:
+            if o.get("speed_mph") is None or o.get("dir_deg") is None: continue
+            spd  = int(o["speed_mph"])
+            gust = int(o["gust_mph"]) if o.get("gust_mph") else None
+            color = "#4ade80" if spd < 15 else "#facc15" if spd < 25 else "#fb923c" if spd < 40 else "#f87171"
+            to_dir = (o["dir_deg"] + 180) % 360  # arrow points TO direction
+            html = f"""<div style="
+                font-family:monospace;text-align:center;
+                transform:rotate({to_dir}deg);font-size:20px;
+                color:{color};filter:drop-shadow(0 0 3px {color}88);
+                ">↑</div>
+                <div style="font-size:9px;font-family:monospace;font-weight:700;
+                color:{color};background:#07090dcc;padding:1px 3px;
+                border-radius:2px;white-space:nowrap;text-align:center;
+                ">{spd}{f"g{gust}" if gust else ""}mph</div>"""
+            popup_txt = (
+                f"<b style='color:{color}'>{o['id']} — {o['name']}</b><br>"
+                f"Wind: {spd}mph from {int(o['dir_deg'])}°"
+                + (f" (gusts {gust}mph)" if gust else "")
+                + (f"<br>Precip (1h): {o['precip_in']}\"" if o.get('precip_in') is not None else "")
+                + (f"<br>Temp: {int(o['temp_f'])}°F" if o.get('temp_f') is not None else "")
+                + (f"<br>{o['desc']}" if o.get('desc') else "")
+            )
+            folium.Marker(
+                location=[o["lat"], o["lng"]],
+                icon=folium.DivIcon(html=html, icon_size=(50,40), icon_anchor=(25,10)),
+                popup=folium.Popup(f'<div style="font-family:monospace;font-size:11px">{popup_txt}</div>', max_width=220),
+                tooltip=f"{o['id']}: {spd}mph"
+            ).add_to(wind_fg)
+        wind_fg.add_to(m)
+
     folium.LayerControl().add_to(m)
     return m
 
@@ -253,6 +329,20 @@ with st.sidebar:
     layer_opts = {"hospitals":"🏥 Trauma Centers","shelters":"🏫 Evac Shelters","gauges":"📡 Stream Gauges","eoc":"🏛 EOC / Command","floodRisk":"💧 Flood Risk Areas"}
     active_layers = [k for k,label in layer_opts.items() if st.checkbox(label,value=True,key=f"map_{k}")]
 
+    st.markdown("**WEATHER OVERLAYS**")
+    show_radar = st.checkbox("📡 NEXRAD Radar", value=False, key="show_radar",
+                             help="Iowa State MESONET composite reflectivity tiles — ~5min latency, no key required")
+    show_wind  = st.checkbox("💨 Wind Observations", value=False, key="show_wind",
+                             help="Live NWS surface obs from KNYC, KJFK, KEWR, KLGA")
+    if show_wind:
+        if st.button("↺ Refresh Wind", use_container_width=True):
+            with st.spinner("Fetching wind obs…"):
+                st.session_state.wind_obs = fetch_wind_obs()
+        if "wind_obs" not in st.session_state:
+            with st.spinner("Fetching wind obs…"):
+                st.session_state.wind_obs = fetch_wind_obs()
+    wind_obs = st.session_state.get("wind_obs", []) if show_wind else []
+
     st.divider()
     st.markdown("**LIVE FEEDS**")
     if st.button("↺ Fetch All Feeds",use_container_width=True):
@@ -275,7 +365,26 @@ with st.sidebar:
 
 # ── Main layout ────────────────────────────────────────────────────────────────
 st.markdown("### 🗺️ NYC Operational Map")
-map_data = st_folium(build_map(active_layers), width="100%", height=320, returned_objects=["last_object_clicked_popup"])
+
+if show_wind and wind_obs:
+    st.markdown("**💨 Current Wind Observations**")
+    wind_cols = st.columns(min(len(wind_obs), 4))
+    for i, o in enumerate(wind_obs):
+        with wind_cols[i % 4]:
+            spd  = int(o["speed_mph"]) if o.get("speed_mph") is not None else None
+            gust = int(o["gust_mph"])  if o.get("gust_mph")  is not None else None
+            st.metric(
+                label=f"{o['id']} — {o['name']}",
+                value=f"{spd}mph" + (f" g{gust}" if gust else "") if spd is not None else "—",
+                delta=f"{int(o['dir_deg'])}° · {o.get('desc','')[:20]}" if o.get("dir_deg") is not None else None,
+                delta_color="off"
+            )
+
+if show_radar:
+    st.caption("📡 NEXRAD radar overlay active — ~5min latency · Iowa State MESONET")
+
+map_data = st_folium(build_map(active_layers, show_radar=show_radar, show_wind=show_wind, wind_obs=wind_obs),
+                     width="100%", height=360, returned_objects=["last_object_clicked_popup"])
 
 if map_data and map_data.get("last_object_clicked_popup"):
     m2=re.search(r'<b[^>]*>([^<]+)</b>',map_data["last_object_clicked_popup"] or "")
@@ -283,8 +392,184 @@ if map_data and map_data.get("last_object_clicked_popup"):
 
 st.markdown("---")
 
-# ── Tabs: Chat | ESRI Search ──────────────────────────────────────────────────
+# ── Tabs ──────────────────────────────────────────────────────────────────────
 tab_chat, tab_noaa, tab_esri = st.tabs(["💬 EMBER Chat", "📡 NOAA Data Stack", "⊕ ESRI / Living Atlas"])
+
+# ── NOAA Tab ──────────────────────────────────────────────────────────────────
+NOAA_ENDPOINTS_FLAT = [
+    # NWS
+    {"id":"nws_alerts_ny",    "cat":"NWS",   "color":"#60a5fa","icon":"🌩","name":"Active Alerts — NY",              "url":"https://api.weather.gov/alerts/active?area=NY",                                                                                        "desc":"All active NWS alerts for New York State",                                "tags":["alerts","flood","tornado","winter storm"]},
+    {"id":"nws_alerts_severe","cat":"NWS",   "color":"#60a5fa","icon":"🌩","name":"Extreme/Severe Alerts Only",       "url":"https://api.weather.gov/alerts/active?area=NY&severity=Extreme,Severe&status=Actual",                                                    "desc":"Only extreme and severe active alerts",                                    "tags":["extreme","severe","priority"]},
+    {"id":"nws_forecast_nyc", "cat":"NWS",   "color":"#60a5fa","icon":"🌩","name":"7-Day Forecast — NYC",             "url":"https://api.weather.gov/gridpoints/OKX/33,37/forecast",                                                                                 "desc":"NWS OKX 7-day text forecast for NYC metro",                               "tags":["forecast","7-day","temperature"]},
+    {"id":"nws_forecast_hrly","cat":"NWS",   "color":"#60a5fa","icon":"🌩","name":"Hourly Forecast — NYC",            "url":"https://api.weather.gov/gridpoints/OKX/33,37/forecast/hourly",                                                                          "desc":"Hour-by-hour forecast — temp, wind, precipitation probability",           "tags":["hourly","wind","precipitation"]},
+    {"id":"nws_grid_wind",    "cat":"NWS",   "color":"#60a5fa","icon":"🌩","name":"Wind & Precip Grid — NYC",         "url":"https://api.weather.gov/gridpoints/OKX/33,37",                                                                                          "desc":"Full NWS gridpoint — wind speed, gusts, direction, QPF, precip prob",    "tags":["wind","QPF","precipitation","grid"]},
+    {"id":"nws_obs_knyc",     "cat":"NWS",   "color":"#60a5fa","icon":"🌩","name":"Observations — Central Park",      "url":"https://api.weather.gov/stations/KNYC/observations/latest",                                                                             "desc":"Latest surface observation from Central Park",                            "tags":["observations","current conditions","temperature"]},
+    {"id":"nws_obs_kjfk",     "cat":"NWS",   "color":"#60a5fa","icon":"🌩","name":"Observations — JFK Airport",       "url":"https://api.weather.gov/stations/KJFK/observations/latest",                                                                             "desc":"Latest surface observation from JFK",                                     "tags":["observations","airport","coastal"]},
+    {"id":"nws_products_okx", "cat":"NWS",   "color":"#60a5fa","icon":"🌩","name":"Text Products — NWS OKX",          "url":"https://api.weather.gov/products?office=OKX&limit=10",                                                                                  "desc":"Latest NWS text products: AFD, Coastal Hazards, etc.",                   "tags":["AFD","forecast discussion","text products"]},
+    # CO-OPS
+    {"id":"coops_battery",    "cat":"CO-OPS","color":"#34d399","icon":"🌊","name":"Water Level — The Battery",         "url":"https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?date=latest&station=8518750&product=water_level&datum=MLLW&time_zone=lst_ldt&units=english&format=json&application=EMBER",    "desc":"Real-time water level at The Battery — primary NYC surge gauge",          "tags":["water level","surge","battery"]},
+    {"id":"coops_predictions","cat":"CO-OPS","color":"#34d399","icon":"🌊","name":"Tidal Predictions — Battery (48h)", "url":"https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?date=today&range=48&station=8518750&product=predictions&datum=MLLW&time_zone=lst_ldt&interval=hilo&units=english&format=json&application=EMBER","desc":"High/low tide predictions — next 48 hours",                               "tags":["tide predictions","high tide","low tide"]},
+    {"id":"coops_kings_point","cat":"CO-OPS","color":"#34d399","icon":"🌊","name":"Water Level — Kings Point",         "url":"https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?date=latest&station=8516945&product=water_level&datum=MLLW&time_zone=lst_ldt&units=english&format=json&application=EMBER",    "desc":"Real-time water level — Long Island Sound",                              "tags":["water level","long island sound"]},
+    {"id":"coops_sandy_hook", "cat":"CO-OPS","color":"#34d399","icon":"🌊","name":"Water Level — Sandy Hook, NJ",      "url":"https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?date=latest&station=8531680&product=water_level&datum=MLLW&time_zone=lst_ldt&units=english&format=json&application=EMBER",    "desc":"Real-time water level at Sandy Hook — outer harbor reference",           "tags":["water level","sandy hook","outer harbor"]},
+    {"id":"coops_wind",       "cat":"CO-OPS","color":"#34d399","icon":"🌊","name":"Wind — The Battery Station",        "url":"https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?date=latest&station=8518750&product=wind&time_zone=lst_ldt&units=english&format=json&application=EMBER",                     "desc":"Real-time wind speed and direction at The Battery",                      "tags":["wind","meteorological"]},
+    {"id":"coops_stations",   "cat":"CO-OPS","color":"#34d399","icon":"🌊","name":"All CO-OPS Stations — NY",          "url":"https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=waterlevels&state=NY",                                       "desc":"All active water level stations in New York state",                       "tags":["stations","inventory"]},
+    # NCEI
+    {"id":"ncei_datasets",    "cat":"NCEI",  "color":"#f59e0b","icon":"📊","name":"NCEI Dataset Catalog",              "url":"https://www.ncei.noaa.gov/access/services/support/v3/datasets.json",                                                                    "desc":"Full catalog of all NCEI datasets",                                       "tags":["catalog","datasets","metadata"]},
+    {"id":"ncei_daily_cp",    "cat":"NCEI",  "color":"#f59e0b","icon":"📊","name":"Daily Summaries — Central Park (7d)","url":"https://www.ncei.noaa.gov/access/services/data/v1?dataset=daily-summaries&stations=USW00094728&dataTypes=TMAX,TMIN,PRCP,SNOW,AWND&startDate=STARTDATE&endDate=ENDDATE&format=json&units=standard","desc":"Last 7 days of daily weather from Central Park",                          "tags":["daily summaries","temperature","precipitation","snow"],"dynamic":True},
+    {"id":"ncei_daily_jfk",   "cat":"NCEI",  "color":"#f59e0b","icon":"📊","name":"Daily Summaries — JFK (7d)",         "url":"https://www.ncei.noaa.gov/access/services/data/v1?dataset=daily-summaries&stations=USW00094789&dataTypes=TMAX,TMIN,PRCP,SNOW,AWND&startDate=STARTDATE&endDate=ENDDATE&format=json&units=standard","desc":"Last 7 days of daily weather from JFK Airport",                          "tags":["daily summaries","jfk","coastal"],"dynamic":True},
+    {"id":"ncei_storm_meta",  "cat":"NCEI",  "color":"#f59e0b","icon":"📊","name":"Storm Events Dataset Metadata",      "url":"https://www.ncei.noaa.gov/access/services/support/v3/datasets/storm-events.json",                                                      "desc":"Metadata for NCEI storm events database",                                "tags":["storm events","metadata","historical"]},
+    # SPC
+    {"id":"spc_watches",      "cat":"SPC",   "color":"#f87171","icon":"⚡","name":"Active Watches (Tornado/SVR)",       "url":"https://www.spc.noaa.gov/products/watch/ActiveWW.txt",                                                                                 "desc":"Currently active SPC watches",                                            "tags":["watches","tornado","severe thunderstorm"],"text":True},
+    {"id":"spc_day1",         "cat":"SPC",   "color":"#f87171","icon":"⚡","name":"Day 1 Convective Outlook",           "url":"https://www.spc.noaa.gov/products/outlook/day1otlk.txt",                                                                               "desc":"SPC Day 1 convective outlook — categorical severe risk",                  "tags":["convective","outlook","severe"],"text":True},
+    # SWPC
+    {"id":"swpc_alerts",      "cat":"SWPC",  "color":"#a78bfa","icon":"☀️","name":"Space Weather Alerts",              "url":"https://services.swpc.noaa.gov/products/alerts.json",                                                                                   "desc":"Current space weather alerts, watches, warnings",                         "tags":["space weather","geomagnetic","solar flare","GPS"]},
+    {"id":"swpc_solar_wind",  "cat":"SWPC",  "color":"#a78bfa","icon":"☀️","name":"Solar Wind — DSCOVR Real-Time",      "url":"https://services.swpc.noaa.gov/products/solar-wind/plasma-7-day.json",                                                                 "desc":"Real-time solar wind plasma from DSCOVR satellite",                      "tags":["solar wind","real-time","DSCOVR"]},
+    {"id":"swpc_kp",          "cat":"SWPC",  "color":"#a78bfa","icon":"☀️","name":"Planetary K-Index (1-min)",          "url":"https://services.swpc.noaa.gov/json/planetary_k_index_1m.json",                                                                        "desc":"1-minute Kp index — geomagnetic disturbance level",                      "tags":["Kp index","geomagnetic"]},
+]
+
+import datetime as _dt
+
+def _resolve_url(ep):
+    url = ep["url"]
+    if ep.get("dynamic"):
+        today    = _dt.date.today().isoformat()
+        week_ago = (_dt.date.today() - _dt.timedelta(days=7)).isoformat()
+        url = url.replace("STARTDATE", week_ago).replace("ENDDATE", today)
+    return url
+
+def _fetch_noaa_ep(ep):
+    url = _resolve_url(ep)
+    try:
+        r = requests.get(url, timeout=10, headers={"User-Agent":"EMBER/1.0"})
+        r.raise_for_status()
+        if ep.get("text") or "text/plain" in r.headers.get("content-type",""):
+            return {"success":True,"data":r.text,"text":True,"ep":ep}
+        return {"success":True,"data":r.json(),"text":False,"ep":ep}
+    except Exception as e:
+        return {"success":False,"error":str(e),"ep":ep}
+
+def _summarize_noaa(result):
+    if not result["success"]: return f"[{result['ep']['name']}: failed — {result['error']}]"
+    d, ep = result["data"], result["ep"]
+    try:
+        if result.get("text"): return f"[NOAA {ep['name']}]\n{str(d)[:800]}"
+        if "features" in d and "alert" in ep["id"]:
+            alerts = "\n".join(f"  - {f['properties']['event']} ({f['properties']['severity']}): {str(f['properties'].get('headline',''))[:90]}" for f in d["features"][:5])
+            return f"[NWS Alerts: {len(d['features'])} active]\n{alerts or '  None'}"
+        if "forecast" in ep["id"] and "properties" in d and "periods" in d.get("properties",{}):
+            periods = "\n".join(f"  {p['name']}: {p['shortForecast']}, {p['temperature']}°{p['temperatureUnit']}" for p in d["properties"]["periods"][:6])
+            return f"[NWS Forecast]\n{periods}"
+        if "grid" in ep["id"] and "properties" in d:
+            p = d["properties"]
+            ws = p.get("windSpeed",{}).get("values",[])[:6]
+            speeds = ", ".join(f"{(v['value']*0.621371):.0f}mph" for v in ws if v.get("value") is not None)
+            qpf = p.get("quantitativePrecipitation",{}).get("values",[])[:6]
+            inches = ", ".join(f"{(v['value']*0.0393701):.2f}\"" for v in qpf if v.get("value") is not None)
+            return f"[NWS Gridpoint Wind & Precip]\n  Wind (next 6h): {speeds}\n  QPF (next 6h): {inches}"
+        if "obs" in ep["id"] and "properties" in d:
+            p = d["properties"]
+            tempF = f"{(p['temperature']['value']*9/5+32):.1f}°F" if p.get("temperature",{}).get("value") is not None else "?"
+            windMph = f"{(p['windSpeed']['value']*0.621371):.1f}mph" if p.get("windSpeed",{}).get("value") is not None else "?"
+            return f"[NWS Obs — {ep['name']}]\n  Temp: {tempF} | Wind: {windMph} | {p.get('textDescription','?')}"
+        if "coops_battery" in ep["id"] and "data" in d:
+            latest = d["data"][-1] if d.get("data") else {}
+            return f"[CO-OPS Battery Water Level]\n  Latest: {latest.get('v','?')} ft MLLW @ {latest.get('t','?')}"
+        if "predictions" in ep["id"] and "predictions" in d:
+            preds = "\n".join(f"  {'HIGH' if p['type']=='H' else 'low '} {p['v']}ft @ {p['t']}" for p in d["predictions"][:6])
+            return f"[CO-OPS Tidal Predictions]\n{preds}"
+        if "stations" in ep["id"] and "stations" in d:
+            return f"[CO-OPS Stations: {len(d['stations'])}]\n" + "\n".join(f"  {s['id']}: {s['name']}" for s in d["stations"][:8])
+        if "datasets" in ep["id"] and "datasets" in d:
+            return f"[NCEI Datasets: {len(d['datasets'])}]\n" + "\n".join(f"  {ds['id']}: {ds['name']}" for ds in d["datasets"][:10])
+        if isinstance(d, list) and len(d) > 0 and isinstance(d[0], dict) and "DATE" in d[0]:
+            rows = "\n".join(f"  {r['DATE']}: TMAX={r.get('TMAX','?')} TMIN={r.get('TMIN','?')} PRCP={r.get('PRCP','?')}" for r in d[:7])
+            return f"[NCEI Daily Summaries]\n{rows}"
+        if isinstance(d, list) and ep["id"] == "swpc_alerts":
+            return f"[Space Weather Alerts: {len(d)}]\n" + "\n".join(f"  {str(a.get('message',''))[:120]}" for a in d[:4])
+        return f"[NOAA {ep['name']}]: {json.dumps(d)[:400]}"
+    except Exception as e:
+        return f"[NOAA {ep['name']}: parse error — {e}]"
+
+with tab_noaa:
+    st.markdown("#### NOAA Open Data Stack")
+    st.caption("No API key required · NWS · CO-OPS Tides & Currents · NCEI Climate · SPC · SWPC Space Weather")
+
+    if "noaa_results" not in st.session_state: st.session_state.noaa_results = {}
+    if "noaa_items"   not in st.session_state: st.session_state.noaa_items   = []
+
+    nc1, nc2 = st.columns([3,2])
+    with nc1: noaa_search = st.text_input("Search endpoints…", placeholder="flood, tide, temperature, alerts, solar wind…", key="noaa_search")
+    with nc2: noaa_cat    = st.selectbox("Category", ["All","NWS","CO-OPS","NCEI","SPC","SWPC"], key="noaa_cat")
+
+    filtered_eps = [ep for ep in NOAA_ENDPOINTS_FLAT if
+        (noaa_cat == "All" or ep["cat"] == noaa_cat) and
+        (not noaa_search or
+         noaa_search.lower() in ep["name"].lower() or
+         noaa_search.lower() in ep["desc"].lower() or
+         any(noaa_search.lower() in t for t in ep.get("tags",[])))
+    ]
+
+    injected_noaa_ids = {i["item_id"] for i in st.session_state.noaa_items}
+    st.caption(f"{len(filtered_eps)} endpoint{'s' if len(filtered_eps)!=1 else ''} · {len(st.session_state.noaa_results)} fetched · {len(injected_noaa_ids)} in KB")
+
+    for ep in filtered_eps:
+        result  = st.session_state.noaa_results.get(ep["id"])
+        injected = ep["id"] in injected_noaa_ids
+
+        st.markdown(f"""<div class="esri-card" style="border-left:3px solid {ep['color']}">
+            <div style="font-weight:700;color:#dde;margin-bottom:2px">{ep['icon']} {ep['name']}</div>
+            <div style="font-size:10px;color:#556;margin-bottom:4px">{ep['desc']}</div>
+            <div>{"".join(f'<span class="pill" style="background:{ep["color"]}18;color:{ep["color"]};border:1px solid {ep["color"]}33;margin:1px">{t}</span>' for t in ep.get("tags",[])[:4])}</div>
+        </div>""", unsafe_allow_html=True)
+
+        btn1, btn2, btn3, status_col = st.columns([1,1,1,2])
+
+        with btn1:
+            if st.button("▶ Fetch", key=f"nfetch_{ep['id']}", use_container_width=True):
+                with st.spinner(f"Fetching…"):
+                    st.session_state.noaa_results[ep["id"]] = _fetch_noaa_ep(ep)
+                st.rerun()
+
+        with btn2:
+            if result and result["success"]:
+                if not injected:
+                    if st.button("+ Add to KB", key=f"ninject_{ep['id']}", use_container_width=True):
+                        content = _summarize_noaa(result)
+                        st.session_state.noaa_items.append({
+                            "name": f"NOAA: {ep['name']}",
+                            "item_id": ep["id"],
+                            "content": f"[NOAA Open Data — {ep['name']}]\nSource: {_resolve_url(ep)}\n\n{content}"
+                        })
+                        st.session_state.pending_query = f"I just added '{ep['name']}' NOAA data to the knowledge base. Summarize the data and flag any emergency-relevant readings for NYC."
+                        st.rerun()
+                else:
+                    st.button("✓ In KB", key=f"ninjected_{ep['id']}", disabled=True, use_container_width=True)
+
+        with btn3:
+            st.link_button("↗ URL", _resolve_url(ep))
+
+        with status_col:
+            if result:
+                if result["success"]:
+                    st.markdown('<span class="pill p-green">● OK</span>', unsafe_allow_html=True)
+                else:
+                    st.markdown(f'<span class="pill p-red">● ERR: {result["error"][:50]}</span>', unsafe_allow_html=True)
+
+        if result and result["success"]:
+            with st.expander("Preview"):
+                st.code(_summarize_noaa(result), language=None)
+
+        st.markdown("---")
+
+    if st.session_state.noaa_items:
+        st.markdown(f"**{len(st.session_state.noaa_items)} NOAA feed(s) in KB:**")
+        for i, ni in enumerate(st.session_state.noaa_items):
+            c1, c2 = st.columns([5,1])
+            with c1: st.markdown(f'<span class="pill p-green">▶ {ni["name"][:60]}</span>', unsafe_allow_html=True)
+            with c2:
+                if st.button("✕", key=f"rm_noaa_{i}"):
+                    st.session_state.noaa_items.pop(i)
+                    st.rerun()
 
 # ── ESRI Tab ──────────────────────────────────────────────────────────────────
 with tab_esri:
@@ -402,7 +687,7 @@ with tab_chat:
     def run_query(prompt):
         st.session_state.messages.append({"role":"user","content":prompt})
         with st.chat_message("user"): st.markdown(prompt)
-        noaa_items = st.session_state.get('noaa_items', [])
+        noaa_items = st.session_state.get("noaa_items", [])
         ctx = build_context(st.session_state.files, st.session_state.api_results, active_kb, st.session_state.esri_items, noaa_items)
         msgs = [{"role":m["role"],"content":m["content"]} for m in st.session_state.messages[-10:]]
         with st.chat_message("assistant"):

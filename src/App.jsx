@@ -35,6 +35,12 @@ const MAP_LAYER_TOGGLES = [
   { id: "eoc",        label: "EOC / CMD",   color: "#facc15" },
 ]
 
+// Separate weather overlay toggles (not marker layers)
+const WEATHER_OVERLAY_TOGGLES = [
+  { id: "radar", label: "NEXRAD RADAR", color: "#3b82f6" },
+  { id: "wind",  label: "WIND OBS",     color: "#4ade80" },
+]
+
 // Right-panel tabs
 const RIGHT_TABS = [
   { id: "chat", label: "CHAT" },
@@ -58,6 +64,8 @@ export default function App() {
   const [streaming, setStreaming]           = useState(false)
   const [activeKB, setActiveKB]             = useState(["floodZones","evacZones","criticalInfrastructure","hazardProfiles","resources"])
   const [activeMapLayers, setActiveMapLayers] = useState(["floodRisk","hospitals","shelters","gauges","eoc"])
+  const [showRadar, setShowRadar]           = useState(false)
+  const [showWind,  setShowWind]            = useState(false)
   const [files, setFiles]                   = useState([])          // uploaded docs
   const [esriItems, setEsriItems]           = useState([])          // ESRI metadata injections
   const [noaaItems, setNoaaItems]           = useState([])          // NOAA data injections
@@ -252,6 +260,10 @@ export default function App() {
         <div style={{ width:1, height:14, background:"#1a1e28", margin:"0 4px" }} />
         <span style={{ fontSize:8.5, color:"#2a2e3a", fontWeight:700, letterSpacing:"0.1em", marginRight:3 }}>MAP</span>
         {MAP_LAYER_TOGGLES.map(m => pill(m.label, activeMapLayers.includes(m.id), () => toggleMap(m.id), m.color))}
+        <div style={{ width:1, height:14, background:"#1a1e28", margin:"0 4px" }} />
+        <span style={{ fontSize:8.5, color:"#2a2e3a", fontWeight:700, letterSpacing:"0.1em", marginRight:3 }}>WX</span>
+        {pill("NEXRAD RADAR", showRadar, () => setShowRadar(p => !p), "#3b82f6")}
+        {pill("WIND OBS",     showWind,  () => setShowWind(p  => !p), "#4ade80")}
         <div style={{ marginLeft:"auto", display:"flex", gap:7 }}>
           <button onClick={fetchAPIs} disabled={fetchingAPIs} style={{ padding:"2px 10px", borderRadius:4, fontSize:9.5, fontWeight:700, border:"1.5px solid #4ade8044", background:"transparent", color:"#4ade80", cursor:"pointer", fontFamily:"inherit", opacity:fetchingAPIs?0.5:1 }}>
             {fetchingAPIs ? <span className="spin">↺</span> : "↺"} LIVE FEEDS
@@ -312,7 +324,7 @@ export default function App() {
       >
         {/* Map */}
         <div style={{ width:`${mapWidth}%`, flexShrink:0, position:"relative", borderRight:"1px solid #0f1520" }}>
-          <MapPanel activeLayers={activeMapLayers} onMarkerClick={handleMarkerClick} />
+          <MapPanel activeLayers={activeMapLayers} onMarkerClick={handleMarkerClick} showRadar={showRadar} showWind={showWind} />
 
           {/* Legend */}
           <div style={{ position:"absolute", bottom:24, left:10, zIndex:1000, background:"#07090dee", border:"1px solid #1a1e28", borderRadius:6, padding:"8px 10px", fontSize:9.5, fontFamily:"monospace" }}>
@@ -322,6 +334,17 @@ export default function App() {
                 {l.label}
               </div>
             ))}
+            {showRadar && (
+              <div style={{ display:"flex", alignItems:"center", gap:5, marginBottom:3, color:"#3b82f6" }}>
+                <div style={{ width:7, height:7, borderRadius:2, background:"#3b82f6", flexShrink:0 }} />
+                NEXRAD RADAR
+              </div>
+            )}
+            {showWind && (
+              <div style={{ display:"flex", alignItems:"center", gap:5, color:"#4ade80" }}>
+                <span style={{ fontSize:11 }}>↑</span> WIND OBS
+              </div>
+            )}
           </div>
 
           {selectedMarker && (

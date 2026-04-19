@@ -117,6 +117,29 @@ export const NOAA_CATEGORIES = {
         desc: "Latest NWS text products issued by OKX (Area Forecast Discussion, Coastal Hazards, etc.)",
         tags: ["products","text","AFD","forecast discussion"],
       },
+      {
+        id: "nws_grid_wind",
+        name: "Wind Grid — NYC (OKX 33,37)",
+        url: "https://api.weather.gov/gridpoints/OKX/33,37",
+        desc: "Full NWS gridpoint data for NYC — wind speed, wind direction, wind gust as hourly grid values. Powers map wind overlay.",
+        tags: ["wind","wind speed","wind direction","gust","grid","map layer"],
+        mapLayer: true,
+      },
+      {
+        id: "nws_grid_precip",
+        name: "Precipitation Grid — NYC (OKX 33,37)",
+        url: "https://api.weather.gov/gridpoints/OKX/33,37",
+        desc: "Full NWS gridpoint data for NYC — quantitative precipitation forecast (QPF) and probability of precipitation by hour.",
+        tags: ["precipitation","QPF","rainfall","probability","grid","map layer"],
+        mapLayer: true,
+      },
+      {
+        id: "nws_obs_all_ny",
+        name: "Observation Stations — NY Region",
+        url: "https://api.weather.gov/stations?state=NY&limit=50",
+        desc: "All NWS surface observation stations in New York — used to find nearest active precip/wind sensors.",
+        tags: ["stations","observations","inventory"],
+      },
     ]
   },
 
@@ -356,6 +379,39 @@ export function summarizeNOAAResult(result) {
       return `[NOAA NWS Forecast — ${endpoint.name}]\n${periods}`
     }
 
+    // NWS gridpoint wind or precip
+    if ((endpoint.id === "nws_grid_wind" || endpoint.id === "nws_grid_precip") && data.properties) {
+      const p = data.properties
+      // Wind summary
+      const windVals = p.windSpeed?.values?.slice(0, 12) ?? []
+      const gustVals = p.windGust?.values?.slice(0, 12) ?? []
+      const dirVals  = p.windDirection?.values?.slice(0, 12) ?? []
+      const qpfVals  = p.quantitativePrecipitation?.values?.slice(0, 24) ?? []
+      const popVals  = p.probabilityOfPrecipitation?.values?.slice(0, 12) ?? []
+
+      const windSpeeds = windVals.map(v => v?.value != null ? (v.value * 0.621371).toFixed(0) + "mph" : "?").join(", ")
+      const gustSpeeds = gustVals.map(v => v?.value != null ? (v.value * 0.621371).toFixed(0) + "mph" : "?").join(", ")
+      const windDirs   = dirVals.map(v  => v?.value != null ? v.value.toFixed(0) + "°" : "?").join(", ")
+      const qpf        = qpfVals.map(v  => v?.value != null ? (v.value * 0.0393701).toFixed(2) + '"' : "?").join(", ")
+      const pop        = popVals.map(v  => v?.value != null ? v.value.toFixed(0) + "%" : "?").join(", ")
+
+      // Find peak wind in next 12 hours
+      const peakWind = windVals.reduce((max, v) => (v?.value ?? 0) > (max?.value ?? 0) ? v : max, {value:0})
+      const peakGust = gustVals.reduce((max, v) => (v?.value ?? 0) > (max?.value ?? 0) ? v : max, {value:0})
+      const peakQPF  = qpfVals.reduce((max, v) => (v?.value ?? 0) > (max?.value ?? 0) ? v : max, {value:0})
+
+      return `[NOAA NWS Gridpoint — NYC Wind & Precipitation]
+  Valid area: ${p.forecastOffice ?? "OKX"} grid (33,37)
+  WIND (next 12h): ${windSpeeds}
+  GUSTS (next 12h): ${gustSpeeds}
+  DIRECTION (°): ${windDirs}
+  Peak wind: ${peakWind.value != null ? (peakWind.value * 0.621371).toFixed(0) : "?"}mph @ ${peakWind.validTime ?? "?"}
+  Peak gust: ${peakGust.value != null ? (peakGust.value * 0.621371).toFixed(0) : "?"}mph @ ${peakGust.validTime ?? "?"}
+  PRECIP PROB (next 12h): ${pop}
+  QPF — inches (next 24h): ${qpf}
+  Peak QPF period: ${peakQPF.value != null ? (peakQPF.value * 0.0393701).toFixed(2) : "?"}\" @ ${peakQPF.validTime ?? "?"}`
+    }
+
     // NWS observation
     if (endpoint.id.includes("obs") && data.properties) {
       const p = data.properties
@@ -449,4 +505,51 @@ export function getAllEndpoints() {
   return Object.values(NOAA_CATEGORIES).flatMap(cat =>
     cat.endpoints.map(ep => ({ ...ep, category: cat.label, color: cat.color, icon: cat.icon }))
   )
+}
+
+// ── Extract wind vectors from NWS gridpoint response for map rendering ────────
+// Returns array of { lat, lng, speedMph, gustMph, dirDeg, validTime }
+// NYC OKX grid 33,37 covers roughly 40.5–41.1°N, 74.4–73.6°W
+// We sample every Nth value to avoid overplotting
+export function extractWindVectors(gridpointData, sampleEvery = 3) {
+  if (!gridpointData?.properties) return []
+  const p = gridpointData.properties
+
+  const speeds = p.windSpeed?.values     ?? []
+  const gusts  = p.windGust?.values      ?? []
+  const dirs   = p.windDirection?.values ?? []
+
+  // NWS grid for OKX 33,37 — approximate center + nearby points
+  // The gridpoint API returns a single point's time series, not a spatial grid.
+  // For spatial wind arrows we use the observation stations network.
+  // This function extracts the time series for the primary NYC point
+  // and returns a structured array suitable for display in the NOAA panel.
+  const vectors = []
+  const count = Math.min(speeds.length, dirs.length, 24)
+  for (let i = 0; i < count; i += sampleEvery) {
+    const speedKmh = speeds[i]?.value ?? null
+    const gustKmh  = gusts[i]?.value  ?? null
+    const dirDeg   = dirs[i]?.value   ?? null
+    const validTime= speeds[i]?.validTime ?? null
+    if (speedKmh == null || dirDeg == null) continue
+    vectors.push({
+      speedMph:  +(speedKmh * 0.621371).toFixed(1),
+      gustMph:   gustKmh != null ? +(gustKmh * 0.621371).toFixed(1) : null,
+      dirDeg:    +dirDeg.toFixed(0),
+      validTime,
+    })
+  }
+  return vectors
+}
+
+// ── Extract QPF values from gridpoint response ────────────────────────────────
+export function extractQPF(gridpointData) {
+  if (!gridpointData?.properties) return []
+  const qpf = gridpointData.properties.quantitativePrecipitation?.values ?? []
+  const pop  = gridpointData.properties.probabilityOfPrecipitation?.values ?? []
+  return qpf.slice(0, 24).map((v, i) => ({
+    validTime: v.validTime,
+    inchesQPF: v.value != null ? +(v.value * 0.0393701).toFixed(3) : null,
+    precipPct:  pop[i]?.value ?? null,
+  }))
 }
